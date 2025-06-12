@@ -4,7 +4,7 @@
 #define INFO(args...)                                                          \
 	do                                                                         \
 	{                                                                          \
-		pr_info("[AXINFO] " args);                                     \
+		pr_err("[AXINFO] " args);                                     \
 	} while (0)
 
 #define WARNING(args...)                                                       \

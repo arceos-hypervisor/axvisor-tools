@@ -17,6 +17,7 @@ MODULE := axvisor-driver
 # Source files
 SRC := main.o \
 	   hvc.o \
+	   ring.o \
 	   ivc.o
 
 # Default target
