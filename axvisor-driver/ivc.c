@@ -166,7 +166,10 @@ int ivc_publish_channel(
 	struct axivc_publisher_vdev *vdev;
 	void __iomem *mapped_shm_base;
 
-	INFO("axvisor: Initializing IVC channel with key: 0x%llx\n", channel_key);
+	INFO(
+		"axvisor: Initializing IVC channel with key: 0x%llx, expected size "
+		"0x%llx\n",
+		channel_key, expected_shm_size);
 
 	// Call the hypervisor to publish the channel
 	ret = hvc_publish_channel(
@@ -550,6 +553,7 @@ static ssize_t axivc_publisher_write(
 	struct axivc_publisher_vdev *vdev = file->private_data;
 	void __iomem *mapped_shm_base = vdev->mapped_shm_base;
 	shm_ring_t *ring = (shm_ring_t *)mapped_shm_base;
+	size_t ret;
 
 	// Validate the count to ensure it does not exceed the shared memory size.
 	// if (count > publisher_shm_size)
@@ -567,7 +571,7 @@ static ssize_t axivc_publisher_write(
 	}
 
 	INFO(
-		"axvisor: Try to write %zu bytes to shared memory, key %llx\n", count,
+		"axvisor: Try to write %zu bytes to IVCChannel key [%llx]\n", count,
 		vdev->key);
 
 	// Check shared memory header.
@@ -580,12 +584,25 @@ static ssize_t axivc_publisher_write(
 		return -EINVAL;
 	}
 
-	if (shm_ring_enqueue(mapped_shm_base, buf, count))
+	ret = shm_ring_enqueue(mapped_shm_base, buf, count);
+	if (ret < 0)
+
 	{
-		ERROR(
-			"axvisor: Failed to copy data from user space into shared ring "
-			"buffer\n");
-		return -EFAULT;
+		if (ret == -EAGAIN)
+		{
+			ERROR(
+				"axvisor: Shared memory ring buffer is full, cannot enqueue "
+				"data\n");
+			return ret; // Return error if the ring buffer is full
+		}
+		else
+		{
+			ERROR(
+				"axvisor: Failed to enqueue data to shared ring buffer, error "
+				"code: %ld\n",
+				ret);
+			return ret; // Return other error codes
+		}
 	}
 
 	// Flush the cache to ensure data is written to shared memory.
@@ -593,9 +610,11 @@ static ssize_t axivc_publisher_write(
 		(unsigned long)mapped_shm_base,
 		(unsigned long)mapped_shm_base + vdev->shm_size);
 
-	INFO("axvisor: Written %zu bytes to shared memory\n", count);
+	INFO(
+		"axvisor: Written %zu bytes to IVCChannel key [%llx]\n", ret,
+		vdev->key);
 
-	return count;
+	return ret;
 }
 
 static int axivc_publisher_open(struct inode *inode, struct file *file)
@@ -679,9 +698,7 @@ static ssize_t axivc_subscriber_read(
 	void __iomem *mapped_shm_base = vdev->mapped_shm_base;
 	shm_ring_t *ring = (shm_ring_t *)mapped_shm_base;
 	size_t bytes_read = 0;
-	size_t bytes_reading = 0;
-	size_t bytes_to_read = count;
-	void *dequeued_buf;
+	int ret;
 
 	if (!vdev->active)
 	{
@@ -700,36 +717,17 @@ static ssize_t axivc_subscriber_read(
 		return -EINVAL;
 	}
 	INFO(
-		"axvisor: Try to read from IVCChannel ID %lld key %llx\n",
-		vdev->publisher_id, vdev->key);
+		"axvisor: Try to read %ld bytes from IVCChannel ID [%lld] key [%llx]\n",
+		count, vdev->publisher_id, vdev->key);
 
-	while (bytes_to_read > 0)
+	ret = shm_ring_dequeue(mapped_shm_base, buf, count, &bytes_read);
+	if (ret < 0)
 	{
-		if (shm_ring_dequeue(
-				mapped_shm_base, &dequeued_buf, &bytes_reading, bytes_to_read))
-		{
-			// If no data is available, return 0 to indicate end of file.
-			if (bytes_reading == 0)
-			{
-				WARNING(
-					"axvisor: No data available in shared ring buffer, but "
-					"shm_ring_dequeue still return ture\n");
-				return -EFAULT; // No data available
-			}
-
-			// Copy the dequeued data to user space
-			if (copy_to_user(buf + bytes_read, dequeued_buf, bytes_reading))
-			{
-				ERROR("axvisor: Failed to copy data to user space\n");
-				return -EFAULT; // Copy failed
-			}
-			bytes_read += bytes_reading;
-			bytes_to_read -= bytes_reading;
-		}
-		else
-		{
-			break; // Exit loop if no more data to read
-		}
+		ERROR(
+			"axvisor: Failed to read data from shared ring buffer, error "
+			"code: %d\n",
+			ret);
+		return ret; // Return error code
 	}
 
 	return bytes_read; // Return number of bytes read
@@ -754,7 +752,7 @@ axivc_manager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 		}
 
 		INFO(
-			"axvisor: Publishing channel with key: 0x%llx, size: %llx\n",
+			"axvisor: Publishing channel with key: 0x%llx, size: 0x%llx\n",
 			publish_arg.channel_key, publish_arg.channel_size);
 
 		shm_size = publish_arg.channel_size;
