@@ -3,12 +3,9 @@
 
 #include <stddef.h>
 
+#include <ivc/ivc_dev.h>
+
 #define MAX_VDEVS 16
-
-#define IVC_PUBLISHER_DEV_NAME_PREFIX "axivc_publisher_"
-#define IVC_SUBSCRIBER_DEV_NAME_PREFIX "axivc_subscriber_"
-
-#define IVC_DEV_NAME "axivc"
 
 int init_ivc_devices(void);
 void uninit_ivc_devices(void);
