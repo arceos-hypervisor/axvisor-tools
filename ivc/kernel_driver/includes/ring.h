@@ -1,5 +1,4 @@
-#ifndef _AXVISOR_RING_H_
-#define _AXVISOR_RING_H_
+#pragma once
 
 #include <stdatomic.h>
 #include <stddef.h>
@@ -27,5 +26,3 @@ void shm_ring_init(
 size_t shm_ring_enqueue(void *base, const char __user *data, size_t len);
 int shm_ring_dequeue(
 	void *base, char __user *buf, size_t count, size_t *out_len);
-
-#endif // _AXVISOR_RING_H_

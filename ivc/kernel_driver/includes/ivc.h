@@ -1,39 +1,11 @@
-#ifndef __IVC_H__
-#define __IVC_H__
+#pragma once
 
 #include <stddef.h>
 
+#include <ivc/ioctl_args.h>
 #include <ivc/ivc_dev.h>
 
 #define MAX_VDEVS 16
 
 int init_ivc_devices(void);
 void uninit_ivc_devices(void);
-
-struct ivc_shm_header
-{
-	u64 publisher_id;
-	u64 key;
-	u64 content_size;
-};
-
-typedef struct ivc_publish_arg
-{
-	uint64_t channel_key;
-	uint64_t channel_size;
-	char device_name[64];
-} ivc_publish_arg_t;
-
-typedef struct ivc_subscribe_arg
-{
-	uint64_t target_publisher_id;
-	uint64_t channel_key;
-	char device_name[64];
-} ivc_subscribe_arg_t;
-
-#define IVC_PUBLISH_CHANNEL _IOW(0, 0, ivc_publish_arg_t)
-#define IVC_UNPUBLISH_CHANNEL _IOW(0, 1, ivc_publish_arg_t)
-#define IVC_SUBSCRIBE_CHANNEL _IOW(0, 2, ivc_subscribe_arg_t)
-#define IVC_UNSUBSCRIBE_CHANNEL _IOW(0, 3, ivc_subscribe_arg_t)
-
-#endif // __IVC_H__
