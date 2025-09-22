@@ -3,6 +3,7 @@
 mod hvc;
 mod instance;
 mod shared_pages;
+mod vmm;
 
 #[allow(static_mut_refs)]
 mod proxy;
@@ -39,6 +40,11 @@ enum CLISubCmd {
         #[command(subcommand)]
         subcmd: HvSubCmd,
     },
+    /// Subcommands related to the management of the guest VM.
+    VM {
+        #[command(subcommand)]
+        subcmd: VMSubCmd,
+    },
     /// Subcommands related to the management of the container instance.
     Instance {
         #[command(subcommand)]
@@ -57,6 +63,23 @@ enum HvSubCmd {
     /// Disable arceos-hypervisor type1.5.
     Disable,
 }
+
+#[derive(Subcommand, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
+#[command(flatten_help = true)]
+enum VMSubCmd {
+    /// list the info of the VM
+    List,
+    /// Create a new instance.
+    Create(VMCreateArgs),
+    /// Remove a VM by its ID.
+    Remove {
+        /// VM ID to remove.
+        #[arg(short, long)]
+        vm_id: i32,
+    },
+}
+
 
 #[derive(Subcommand, Debug)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -88,6 +111,16 @@ struct InstanceCreateArgs {
     /// Use one2one mapping or coarse-grained mapping.
     #[arg(short, long, default_value_t = false)]
     pub one2onemapping: bool,
+}
+
+#[derive(Debug, Args)]
+struct VMCreateArgs {
+    /// VM name.
+    #[arg(short, long)]
+    pub name: String,
+    /// Configuration file path.
+    #[arg(short, long)]
+    pub cfg_path: String,
 }
 
 #[derive(Parser, Debug)]
@@ -165,5 +198,10 @@ fn main() {
             InstanceSubCmd::Remove { instance_id } => instance::remove_instance(instance_id as _),
         },
         CLISubCmd::Loader(args) => loader::local_execute(args),
+        CLISubCmd::VM { subcmd } => match subcmd {
+            VMSubCmd::List => vmm::list_vms(),
+            VMSubCmd::Create(args) => vmm::create_vm(args),
+            VMSubCmd::Remove { vm_id } => vmm::remove_vm(vm_id as _),
+        },
     }
 }

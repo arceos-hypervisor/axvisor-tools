@@ -29,7 +29,7 @@ const fn ioc(dir: u32, ty: u32, nr: u32, size: usize) -> u64 {
 }
 
 /// _IOW type: write to kernel from user
-const fn iow<T>(ty: u32, nr: u32) -> u64 {
+pub const fn iow<T>(ty: u32, nr: u32) -> u64 {
     ioc(IOC_WRITE, ty, nr, size_of::<T>())
 }
 

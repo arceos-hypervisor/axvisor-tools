@@ -22,6 +22,7 @@ memory_addr = "0.3"
 page_table_multiarch = "0.5"
 axhvc = { git = "https://github.com/arceos-hypervisor/axhvc.git" }
 pi_memory_layout = { git = "https://github.com/EquationOS/pi-memory-layout.git" }
+axvmconfig = { git = "https://github.com/arceos-hypervisor/axvmconfig.git", default-features = false }
 
 [patch."https://github.com/arceos-hypervisor/axhvc.git"]
 axhvc = { path = "../../../crates/axhvc" }
