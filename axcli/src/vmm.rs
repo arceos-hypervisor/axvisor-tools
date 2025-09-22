@@ -9,7 +9,7 @@ use crate::VMCreateArgs;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct AxCreateVMArg {
+pub struct AxIoctlCreateVMArg {
     pub vm_id: u64,
     pub kernel_image_addr: u64,
     pub kernel_image_size: u64,
@@ -24,7 +24,7 @@ pub struct AxCreateVMArg {
 const JAILHOUSE_DEVICE_NAME: &CStr =
     unsafe { CStr::from_bytes_with_nul_unchecked(b"/dev/jailhouse\0") };
 
-const AX_CREATE_VM: u64 = iow::<AxCreateVMArg>(0, 0x11);
+const AX_CREATE_VM: u64 = iow::<AxIoctlCreateVMArg>(0, 0x11);
 
 fn open_jailhouse_dev() -> Result<c_int, String> {
     let fd = unsafe {
@@ -94,7 +94,7 @@ pub fn create_vm(args: VMCreateArgs) {
         .as_str(),
     );
 
-    let mut create_arg = AxCreateVMArg {
+    let mut create_arg = AxIoctlCreateVMArg {
         vm_id: 0, // Let the kernel assign an ID
         kernel_image_addr: kernel_image_buffer.as_ptr() as u64,
         kernel_image_size: kernel_image_buffer.len() as u64,
@@ -115,6 +115,8 @@ pub fn create_vm(args: VMCreateArgs) {
     };
 
     let fd = open_jailhouse_dev().expect("Failed to open jailhouse device");
+
+    info!("ioctl fd : {}, request {:#x}", fd, AX_CREATE_VM);
 
     let ret = unsafe { libc::ioctl(fd, AX_CREATE_VM as libc::c_ulong, &mut create_arg as *mut _) };
 
