@@ -15,17 +15,5 @@ lazyinit = "0.2"
 axerrno = "0.1.0"
 sc = "0.2.7"
 
-memory_addr = "0.3"
-page_table_multiarch = "0.5"
-axhvc = { git = "https://github.com/arceos-hypervisor/axhvc.git" }
+axhvc = { git = "https://github.com/arceos-hypervisor/axhvc.git", branch = "create_vm" }
 axvmconfig = { git = "https://github.com/arceos-hypervisor/axvmconfig.git", default-features = false }
-
-[patch."https://github.com/arceos-hypervisor/axhvc.git"]
-axhvc = { path = "../../../crates/axhvc" }
-
-[patch.crates-io]
-memory_addr = { path = "../../../crates/memory_addr/memory_addr" }
-page_table_multiarch = { path = "../../../crates/page_table_multiarch/page_table_multiarch" }
-
-[build-dependencies]
-bindgen = "0.72"
