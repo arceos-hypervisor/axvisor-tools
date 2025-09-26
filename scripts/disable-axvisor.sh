@@ -1,7 +1,6 @@
 #!/bin/bash
 set -x
 
-JH_DIR=./jailhouse-axvisor
-JH=$JH_DIR/tools/jailhouse
+JH=./out/jailhouse
 
 sudo $JH disable
