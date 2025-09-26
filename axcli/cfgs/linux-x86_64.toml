@@ -10,7 +10,7 @@ vm_type = 1
 # The number of virtual CPUs.
 cpu_num = 1
 # Guest vm physical cpu sets.
-phys_cpu_sets = [8]
+phys_cpu_sets = [0x2000] # 1 << 13, use cpu 13 (nuc15 has 14 cores)
 
 #
 # Vm kernel configs
