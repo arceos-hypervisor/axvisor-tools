@@ -7,6 +7,29 @@ use linux_libc_auxv::{AuxVar, AuxVarFlags, StackLayoutBuilder, StackLayoutRef};
 
 use equation_defs::{USER_LDSO_BASE_VA, USER_PIE_BASE_VA, USER_STACK_SIZE, USER_STACK_TOP_VA};
 
+fn panic_mmap_failed(
+    context: &str,
+    addr: *mut c_void,
+    size: usize,
+    prot: c_int,
+    flags: c_int,
+    fd: c_int,
+    offset: off_t,
+) -> ! {
+    let err = std::io::Error::last_os_error();
+    panic!(
+        "mmap failed in {context}: addr={:#x}, size={:#x}, prot={:#x}, flags={:#x}, fd={}, offset={}, errno={:?}, detail={}",
+        addr as usize,
+        size,
+        prot,
+        flags,
+        fd,
+        offset,
+        err.raw_os_error(),
+        err
+    );
+}
+
 // // const STACK_SIZE: usize = 1024 * 1024 * 8;
 // const STACK_SIZE: usize = 0x1000 * 4; // 16KB stack size
 // const PIE_BASE: usize = 0x40000000;
@@ -43,15 +66,29 @@ unsafe fn mmap_segment(
         aligned_addr, size, aligned_offset
     );
 
+    let mmap_prot = (prot | PROT_WRITE) as c_int;
+    let mmap_flags = (MAP_SHARED | MAP_FIXED) as c_int;
+    let mmap_offset = 0 as off_t;
+
     let ret = mmap(
         aligned_addr as *mut c_void,
         size,
-        (prot | PROT_WRITE) as c_int,
-        (MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED) as c_int,
+        mmap_prot,
+        mmap_flags,
         target_fd,
-        0,
+        mmap_offset,
     );
-    assert_ne!(ret, MAP_FAILED);
+    if ret == MAP_FAILED {
+        panic_mmap_failed(
+            "mmap_segment",
+            aligned_addr as *mut c_void,
+            size,
+            mmap_prot,
+            mmap_flags,
+            target_fd,
+            mmap_offset,
+        );
+    }
 
     assert_eq!(
         ret as usize, aligned_addr,
@@ -133,16 +170,31 @@ unsafe fn mmap_elf(
 
     let file_length = stat.st_size as usize;
 
+    let mmap_addr = 0 as *mut c_void;
+    let mmap_prot = PROT_READ as c_int;
+    let mmap_flags = MAP_PRIVATE as c_int;
+    let mmap_offset = 0 as off_t;
+
     let data = mmap(
-        0 as *mut c_void,
+        mmap_addr,
         file_length,
-        PROT_READ as c_int,
-        MAP_PRIVATE as c_int,
+        mmap_prot,
+        mmap_flags,
         fd as c_int,
-        0,
+        mmap_offset,
     );
 
-    assert_ne!(data, MAP_FAILED, "Failed to mmap ELF file: {}", path);
+    if data == MAP_FAILED {
+        panic_mmap_failed(
+            "mmap_elf file mapping",
+            mmap_addr,
+            file_length,
+            mmap_prot,
+            mmap_flags,
+            fd as c_int,
+            mmap_offset,
+        );
+    }
     info!(
         "[*] Mapped ELF file: {} at address {:#x}",
         path, data as usize
@@ -198,17 +250,32 @@ unsafe fn mmap_elf(
 }
 
 unsafe fn setup_raw_stack() -> *mut c_void {
-    let (fd, flags) = (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
+    let (fd, flags) = (-1, MAP_SHARED | MAP_FIXED);
+
+    let stack_addr = (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void;
+    let prot = (PROT_READ | PROT_WRITE) as c_int;
+    let flags = flags as c_int;
+    let offset = 0 as off_t;
 
     let stack = mmap(
-        (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void, // Start of the stack
+        stack_addr, // Start of the stack
         USER_STACK_SIZE,
-        (PROT_READ | PROT_WRITE) as c_int,
-        flags as c_int,
+        prot,
+        flags,
         fd,
-        0,
+        offset,
     );
-    assert_ne!(stack, MAP_FAILED);
+    if stack == MAP_FAILED {
+        panic_mmap_failed(
+            "setup_raw_stack",
+            stack_addr,
+            USER_STACK_SIZE,
+            prot,
+            flags,
+            fd,
+            offset,
+        );
+    }
     info!("[*] Allocated raw stack at: {:#p}", stack);
     let stack_top = stack as usize + USER_STACK_SIZE;
     assert_eq!(stack_top, USER_STACK_TOP_VA, "Stack top mismatch");
@@ -223,18 +290,42 @@ unsafe fn setup_stack_with_args(
     entry: *mut u8,
     phdr: *mut u8,
     ldso_base: *mut u8,
+    eqdev_fd: Option<i32>,
 ) -> *mut c_void {
-    let (fd, flags) = (-1, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED);
+    let fd = eqdev_fd.unwrap_or(-1);
+
+    debug!(
+        "mapping stack fd {} [{:#x}~{:#x}], size {:#x}",
+        fd,
+        USER_STACK_TOP_VA - USER_STACK_SIZE,
+        USER_STACK_TOP_VA,
+        USER_STACK_SIZE,
+    );
+
+    let stack_addr = (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void;
+    let prot = (PROT_READ | PROT_WRITE) as c_int;
+    let flags = (MAP_SHARED | MAP_FIXED) as c_int;
+    let offset = 0 as off_t;
 
     let stack = mmap(
-        (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void, // Start of the stack
+        stack_addr, // Start of the stack
         USER_STACK_SIZE,
-        PROT_READ | PROT_WRITE,
+        prot,
         flags,
         fd,
-        0,
+        offset,
     );
-    assert_ne!(stack, MAP_FAILED);
+    if stack == MAP_FAILED {
+        panic_mmap_failed(
+            "setup_stack_with_args",
+            stack_addr,
+            USER_STACK_SIZE,
+            prot,
+            flags,
+            fd,
+            offset,
+        );
+    }
 
     let stack_top = stack as usize + USER_STACK_SIZE;
     assert_eq!(stack_top, USER_STACK_TOP_VA);
@@ -355,6 +446,7 @@ pub unsafe fn load_app(
                 entry as *mut u8,
                 phdr as *mut u8,
                 ldso_base as *mut u8,
+                eqdev_fd,
             )
         };
         (ldso_base + ldso_elf.entry as usize, stack as usize)

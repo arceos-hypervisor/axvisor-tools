@@ -13,14 +13,15 @@ use crate::ExecuteArgs;
 
 const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
 
-fn load_elf(fd: i32, args: &ExecuteArgs) {
-    let envp = vec![];
+fn load_elf(fd: i32, args: &ExecuteArgs) -> (usize, usize) {
+    let envp = vec!["EQTEST=1".to_string()];
     let (entry, stack) = unsafe { load_app(&args.exec_args, &envp, Some(fd)) };
 
     info!(
         "ELF loaded successfully, entry: 0x{:x}, stack: 0x{:x}",
         entry, stack
     );
+    (entry, stack)
 }
 
 /// Remote execute in a instance setup by AxVisor.
@@ -51,52 +52,14 @@ pub fn execute(args: ExecuteArgs) {
         return;
     }
 
-    load_elf(instance_fd, &args);
+    let (entry, stack) = load_elf(instance_fd, &args);
 
-    // We need to copy execution metadate to axvisor to start the loader instance.
-    let mut args_builder = ArgsLayoutBuilder::new();
-    // Arguments, arg[0] is the executable file.
-    for arg in &args.exec_args {
-        args_builder.add_argv(arg);
-    }
-    // Set EQTEST environment variable
-    args_builder.add_envv("EQTEST=1");
-
-    let args_layout = args_builder.build();
-
-    if true {
-        // Print the stack layout for debugging purposes
-        let layout = ArgsLayoutRef::new(args_layout.as_ref(), None);
-
-        for (i, arg) in unsafe { layout.argv_iter() }.enumerate() {
-            println!("  [{i}] {}", arg.to_str().unwrap());
-        }
-        for (i, env) in unsafe { layout.envv_iter() }.enumerate() {
-            println!("  [env {i}] {}", env.to_str().unwrap());
-        }
-        for auxv in unsafe { layout.auxv_iter() } {
-            println!("  [auxv] {:?}", auxv);
-        }
-    }
-
-    // Copy the stack layout to axvisor through shared pages
-    // page by page.
-    let mut shared_pages: Vec<*mut c_void> = Vec::new();
-    copy_content_to_shared_pages(&mut shared_pages, args_layout.as_ref());
-
-    let res = hvc_setup_instance(
-        instance_id as _,
-        args_layout.len() as u64,
-        shared_pages.as_ptr() as u64,
-        shared_pages.len() as u64,
-    );
+    let res = hvc_setup_instance(instance_id as _, entry as u64, stack as u64);
     if res < 0 {
         panic!("Failed to setup instance: {}", res);
     }
 
     info!("Setup instance success, instance ID = [{}]", instance_id);
-
-    free_shared_pages(&mut shared_pages);
 
     proxy::setup_proxy_daemon(instance_id, instance_fd);
 

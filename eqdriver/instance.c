@@ -114,6 +114,7 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	int ret = 0;
 	int instance_id = instance_vdev->id;
 	unsigned long pfn_start, mmap_size;
+	__u64 mmap_gpa = 0;
 
 	if (!instance_vdev->active)
 	{
@@ -133,7 +134,7 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 	mmap_size = vma->vm_end - vma->vm_start;
 
 	INFO(
-		"[%s] Instance [%d] remap_pfn_range: va[0x%lx-0x%lx], size 0x%lx, "
+		"[%s] Instance [%d] instance_mmap: va[0x%lx-0x%lx], size 0x%lx, "
 		"pgoff 0x%lx\n",
 		__func__, instance_id, vma->vm_start, vma->vm_end, mmap_size,
 		vma->vm_pgoff);
@@ -208,13 +209,47 @@ static int instance_mmap(struct file *file, struct vm_area_struct *vma)
 			return -EINVAL;
 		}
 
+		INFO(
+			"[%s] Instance [%d] Normal mmap for ELF loading, va 0x%lx "
+			"size 0x%lx prot 0x%llx\n",
+			__func__, instance_id, vma->vm_start, mmap_size,
+			(__u64)pgprot_val(vma->vm_page_prot));
+
 		// Sync the mmap to hypervisor.
-		hvc_mmap_sync(
-			(__u64)vma->vm_start, mmap_size, 0,
+		mmap_gpa = hvc_mmap_sync(
+			(__u64)vma->vm_start, mmap_size,
 			(__u64)pgprot_val(vma->vm_page_prot), instance_vdev->id);
 
-		pfn_start =
-			instance_vdev->metadata.memory_region_base_gpa >> PAGE_SHIFT;
+		// Check alignment of the returned GPA.
+		if (mmap_gpa & ~PAGE_MASK)
+		{
+			ERROR(
+				"Hypervisor failed to sync mmap for instance %d, returned GPA "
+				"0x%llx\n",
+				instance_id, mmap_gpa);
+			return -EIO;
+		}
+		// Check if mmap_gpa is valid.
+		if (!(mmap_gpa >= instance_vdev->metadata.memory_region_base_gpa &&
+			  mmap_gpa <
+				  instance_vdev->metadata.memory_region_base_gpa +
+					  (instance_vdev->metadata.init_memory_region_size_mib
+					   << 20)))
+		{
+			ERROR(
+				"Invalid mmap GPA 0x%llx returned by hypervisor for instance "
+				"%d\n",
+				mmap_gpa, instance_id);
+			ERROR(
+				"Expected GPA range: [0x%llx~0x%llx]\n",
+				instance_vdev->metadata.memory_region_base_gpa,
+				instance_vdev->metadata.memory_region_base_gpa +
+					(instance_vdev->metadata.init_memory_region_size_mib
+					 << 20));
+			return -EINVAL;
+		}
+
+		pfn_start = mmap_gpa >> PAGE_SHIFT;
 	}
 
 	INFO(
@@ -276,6 +311,10 @@ int create_instance(eq_create_instance_arg_t *arg)
 		instance_metadata->scf_region_size,
 		instance_metadata->page_cache_pool_base_gpa,
 		instance_metadata->page_cache_pool_size);
+	INFO(
+		"Instance initial memory region base @ 0x%llx, size 0x%llx\n",
+		instance_metadata->memory_region_base_gpa,
+		instance_metadata->init_memory_region_size_mib << 20);
 
 	if (instance_id < 0)
 	{

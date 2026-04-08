@@ -36,8 +36,7 @@ int hvc_shmget(__u64 key, __u64 size, __u64 shmflg, __u64 shm_base_ptr)
 	return (int)hvc_call(HShmGet, key, size, shmflg, shm_base_ptr, 0, 0);
 }
 
-__u64 hvc_mmap_sync(
-	__u64 va, __u64 size, __u64 pfn, __u64 flags, __u64 instance_id)
+__u64 hvc_mmap_sync(__u64 va, __u64 size, __u64 flags, __u64 instance_id)
 {
-	return hvc_call(HMmapSync, va, size, pfn, flags, instance_id, 0);
+	return hvc_call(HMmapSync, va, size, flags, instance_id, 0, 0);
 }

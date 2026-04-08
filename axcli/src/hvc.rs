@@ -41,23 +41,18 @@ pub fn hvc_init_shim(ksched_shm_base: u64, mode: u64) {
     info!("hvc_init_shim result: {:#x}", result);
 }
 
-pub fn hvc_setup_instance(
-    instance_id: u64,
-    file_size: u64,
-    shared_pages_base: u64,
-    shared_pages_num: u64,
-) -> isize {
+pub fn hvc_setup_instance(instance_id: u64, entry: u64, stack: u64) -> isize {
     info!(
-        "[*] Setting up instance ID: {}, file size: {}, shared pages base: {:#x}, num: {}",
-        instance_id, file_size, shared_pages_base, shared_pages_num
+        "[*] Setting up instance ID: {}, entry: {:#x}, stack: {:#x}",
+        instance_id, entry, stack
     );
 
     trigger_hypercall(
         HyperCallCode::HSetupInstance,
         instance_id,
-        file_size,
-        shared_pages_base,
-        shared_pages_num,
+        entry,
+        stack,
+        0,
         0,
         0,
     )

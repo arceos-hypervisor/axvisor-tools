@@ -14,5 +14,4 @@ int hvc_create_instance(
 
 int hvc_shmget(__u64 key, __u64 size, __u64 shmflg, __u64 shm_base_ptr);
 
-__u64 hvc_mmap_sync(
-	__u64 va, __u64 size, __u64 pfn, __u64 flags, __u64 instance_id);
+__u64 hvc_mmap_sync(__u64 va, __u64 size, __u64 flags, __u64 instance_id);
