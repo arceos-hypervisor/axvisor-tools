@@ -5,7 +5,7 @@ use libc::*;
 
 use linux_libc_auxv::{AuxVar, AuxVarFlags, StackLayoutBuilder, StackLayoutRef};
 
-use equation_defs::{USER_LDSO_BASE_VA, USER_PIE_BASE_VA, USER_STACK_SIZE, USER_STACK_TOP_VA};
+use equation_defs::{LIBOS_LDSO_BASE_VA, LIBOS_PIE_BASE_VA, LIBOS_STACK_SIZE, LIBOS_STACK_TOP_VA};
 
 fn panic_mmap_failed(
     context: &str,
@@ -252,14 +252,14 @@ unsafe fn mmap_elf(
 unsafe fn setup_raw_stack() -> *mut c_void {
     let (fd, flags) = (-1, MAP_SHARED | MAP_FIXED);
 
-    let stack_addr = (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void;
+    let stack_addr = (LIBOS_STACK_TOP_VA - LIBOS_STACK_SIZE) as *mut c_void;
     let prot = (PROT_READ | PROT_WRITE) as c_int;
     let flags = flags as c_int;
     let offset = 0 as off_t;
 
     let stack = mmap(
         stack_addr, // Start of the stack
-        USER_STACK_SIZE,
+        LIBOS_STACK_SIZE,
         prot,
         flags,
         fd,
@@ -269,7 +269,7 @@ unsafe fn setup_raw_stack() -> *mut c_void {
         panic_mmap_failed(
             "setup_raw_stack",
             stack_addr,
-            USER_STACK_SIZE,
+            LIBOS_STACK_SIZE,
             prot,
             flags,
             fd,
@@ -277,8 +277,8 @@ unsafe fn setup_raw_stack() -> *mut c_void {
         );
     }
     info!("[*] Allocated raw stack at: {:#p}", stack);
-    let stack_top = stack as usize + USER_STACK_SIZE;
-    assert_eq!(stack_top, USER_STACK_TOP_VA, "Stack top mismatch");
+    let stack_top = stack as usize + LIBOS_STACK_SIZE;
+    assert_eq!(stack_top, LIBOS_STACK_TOP_VA, "Stack top mismatch");
     stack_top as *mut c_void
 }
 
@@ -297,19 +297,19 @@ unsafe fn setup_stack_with_args(
     debug!(
         "mapping stack fd {} [{:#x}~{:#x}], size {:#x}",
         fd,
-        USER_STACK_TOP_VA - USER_STACK_SIZE,
-        USER_STACK_TOP_VA,
-        USER_STACK_SIZE,
+        LIBOS_STACK_TOP_VA - LIBOS_STACK_SIZE,
+        LIBOS_STACK_TOP_VA,
+        LIBOS_STACK_SIZE,
     );
 
-    let stack_addr = (USER_STACK_TOP_VA - USER_STACK_SIZE) as *mut c_void;
+    let stack_addr = (LIBOS_STACK_TOP_VA - LIBOS_STACK_SIZE) as *mut c_void;
     let prot = (PROT_READ | PROT_WRITE) as c_int;
     let flags = (MAP_SHARED | MAP_FIXED) as c_int;
     let offset = 0 as off_t;
 
     let stack = mmap(
         stack_addr, // Start of the stack
-        USER_STACK_SIZE,
+        LIBOS_STACK_SIZE,
         prot,
         flags,
         fd,
@@ -319,7 +319,7 @@ unsafe fn setup_stack_with_args(
         panic_mmap_failed(
             "setup_stack_with_args",
             stack_addr,
-            USER_STACK_SIZE,
+            LIBOS_STACK_SIZE,
             prot,
             flags,
             fd,
@@ -327,8 +327,8 @@ unsafe fn setup_stack_with_args(
         );
     }
 
-    let stack_top = stack as usize + USER_STACK_SIZE;
-    assert_eq!(stack_top, USER_STACK_TOP_VA);
+    let stack_top = stack as usize + LIBOS_STACK_SIZE;
+    assert_eq!(stack_top, LIBOS_STACK_TOP_VA);
 
     let mut stack_builder = StackLayoutBuilder::new();
     for s in argv.iter() {
@@ -414,11 +414,11 @@ pub unsafe fn load_app(
     let app_path = args[0].clone();
 
     let (app_elf, app_base, interp_path) =
-        unsafe { mmap_elf(app_path.as_str(), USER_PIE_BASE_VA, eqdev_fd) };
+        unsafe { mmap_elf(app_path.as_str(), LIBOS_PIE_BASE_VA, eqdev_fd) };
 
     let (entry, stack) = if let Some(interp_path) = interp_path {
         let (ldso_elf, ldso_base, path) =
-            unsafe { mmap_elf(&interp_path, USER_LDSO_BASE_VA, eqdev_fd) };
+            unsafe { mmap_elf(&interp_path, LIBOS_LDSO_BASE_VA, eqdev_fd) };
         if let Some(path) = path {
             panic!(
                 "[*] Found interpreter: {:?} for interp {:?}",
