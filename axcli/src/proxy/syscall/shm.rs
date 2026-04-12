@@ -124,29 +124,31 @@ pub fn sys_shmat_with_shmget_args(
             // The process ID is passed by SCF and used to identify the process within the instance,
             // Note that underlying hypervisor will establish the mapping based on the process ID
             // in the process's state-1 page table.
-            let res = hvc::hvc_daemon_shmat(
+            let guest_shmaddr = hvc::hvc_daemon_shmat(
                 instance_id() as u64,
                 shmget_args.process_id as u64,
                 shmkey as u64,
                 shmaddr as u64,
+                shmget_args.shmgva as u64,
                 size as u64,
                 shmat_flg as u64,
             );
 
-            if res < 0 {
+            if guest_shmaddr < 0 {
                 error!(
                     "Failed to attach shared memory for instance ID: {}, process {} errno: {}",
                     instance_id(),
                     shmget_args.process_id,
-                    res
+                    guest_shmaddr
                 );
                 return Err(LinuxError::ENOMEM);
             }
 
-            trace!("Get instance shm_gpa {:#x}", res as usize);
+            trace!("Get instance shm_gva {:#x}", guest_shmaddr as usize);
 
-            // Update the shmget_args with the actual shared memory address.
-            shmget_args.shmgva = shmaddr as usize;
+            shmget_args.host_shmaddr = shmaddr as usize;
+
+            return Ok(guest_shmaddr as u64);
         }
     }
 
@@ -393,7 +395,7 @@ pub fn sys_mmap_to_memfd(
     // The hypervisor will return the GPA (guest physical address) of the shared memory region
     // which is then used by the instance to access the shared memory.
     // Just reuse the `hvc_daemon_shmat` function for simplicity.
-    let res = hvc::hvc_daemon_shmat(instance_id() as u64, 1, fd, addr, length, flags);
+    let res = hvc::hvc_daemon_shmat(instance_id() as u64, 1, fd, addr, addr, length, flags);
 
     if res == -1 {
         error!(
