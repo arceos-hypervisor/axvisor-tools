@@ -85,6 +85,10 @@ struct InitArgs {
 #[derive(Parser, Debug)]
 #[command(trailing_var_arg = true)]
 struct ExecuteArgs {
+    /// Environment variables to pass to the instance (KEY=VALUE format)
+    /// Can be specified multiple times
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+    pub env_vars: Vec<String>,
     #[arg(required = true)]
     exec_args: Vec<String>,
 }
