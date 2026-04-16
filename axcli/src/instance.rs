@@ -13,8 +13,11 @@ use crate::ExecuteArgs;
 
 const EQINSTANCE_DEV_PREFIX: &str = "/dev/eqinstance_";
 
-fn load_elf(fd: i32, args: &ExecuteArgs) -> (usize, usize) {
-    let envp = vec!["EQTEST=1".to_string()];
+fn load_elf(fd: i32, args: &ExecuteArgs, instance_id: usize) -> (usize, usize) {
+    let mut envp = args.env_vars.clone();
+
+    envp.push(format!("EQINSTANCE={}", instance_id));
+
     let (entry, stack) = unsafe { load_app(&args.exec_args, &envp, Some(fd)) };
 
     info!(
@@ -52,7 +55,7 @@ pub fn execute(args: ExecuteArgs) {
         return;
     }
 
-    let (entry, stack) = load_elf(instance_fd, &args);
+    let (entry, stack) = load_elf(instance_fd, &args, instance_id);
 
     let res = hvc_setup_instance(instance_id as _, entry as u64, stack as u64);
     if res < 0 {
