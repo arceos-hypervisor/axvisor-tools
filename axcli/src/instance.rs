@@ -84,6 +84,12 @@ pub fn execute(args: ExecuteArgs) {
     // Set EQTEST environment variable
     args_builder.add_envv("EQTEST=1");
 
+    // Add environment variables from command line (-e/--env options)
+    for env_var in &args.env_vars {
+        info!("Adding environment variable from command line: {}", env_var);
+        args_builder.add_envv(env_var.clone());
+    }
+
     let args_layout = args_builder.build();
 
     if true {
