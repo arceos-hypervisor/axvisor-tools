@@ -414,6 +414,7 @@ dependencies = [
  "memory_addr",
  "numeric-enum-macro",
  "page_table_multiarch",
+ "pie-btreemap",
  "shenango_defs",
  "spin",
  "syscalls",
@@ -705,6 +706,10 @@ dependencies = [
  "aligned-vec",
  "linux-libc-auxv",
 ]
+
+[[package]]
+name = "pie-btreemap"
+version = "0.1.0"
 
 [[package]]
 name = "plain"
