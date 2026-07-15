@@ -47,3 +47,8 @@ u64 hvc_unsubscribe_channel(u64 publisher_id, u64 channel_key)
 	return hvc_call(
 		HIVCUnSubscribChannel, publisher_id, channel_key, 0, 0, 0, 0);
 }
+
+u64 hvc_notify_channel(u64 publisher_id, u64 channel_key, u64 target_vm_id)
+{
+	return hvc_call(HIVCNotify, publisher_id, channel_key, target_vm_id, 0, 0, 0);
+}

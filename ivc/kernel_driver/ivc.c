@@ -8,7 +8,6 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
-#include <stdatomic.h>
 
 #include "includes/hvc.h"
 #include "includes/ivc.h"
@@ -372,6 +371,16 @@ int ivc_subscribe_channel(u64 publisher_id, u64 key, char *sub_dev_name)
 		ERROR("axvisor: Failed to map shared memory base\n");
 		return -ENOMEM;
 	}
+	ret = axivc_region_validate(mapped_shm_base, shm_size, publisher_id, key);
+	if (ret)
+	{
+		ERROR(
+			"axvisor: Shared IVC region is not axivc v2 compatible, error "
+			"code: %d\n",
+			ret);
+		iounmap(mapped_shm_base);
+		return ret;
+	}
 	mutex_lock(&sub_vdev_lock);
 
 	if (sub_vdev_count >= MAX_VDEVS)
@@ -553,15 +562,7 @@ static ssize_t axivc_publisher_write(
 {
 	struct axivc_publisher_vdev *vdev = file->private_data;
 	void __iomem *mapped_shm_base = vdev->mapped_shm_base;
-	shm_ring_t *ring = (shm_ring_t *)mapped_shm_base;
-	size_t ret;
-
-	// Validate the count to ensure it does not exceed the shared memory size.
-	// if (count > publisher_shm_size)
-	// {
-	// 	ERROR("axvisor: Write size exceeds shared memory size\n");
-	// 	return -EINVAL;
-	// }
+	ssize_t ret;
 
 	if (!vdev->active)
 	{
@@ -574,16 +575,6 @@ static ssize_t axivc_publisher_write(
 	INFO(
 		"axvisor: Try to write %zu bytes to IVCChannel key [%llx]\n", count,
 		vdev->key);
-
-	// Check shared memory header.
-	if (ring->key != vdev->key)
-	{
-		ERROR(
-			"axvisor: Shared memory header key mismatch, expected: 0x%llx, "
-			"got: 0x%llx\n",
-			vdev->key, ring->key);
-		return -EINVAL;
-	}
 
 	ret = shm_ring_enqueue(mapped_shm_base, buf, count);
 	if (ret < 0)
@@ -612,7 +603,7 @@ static ssize_t axivc_publisher_write(
 		(unsigned long)mapped_shm_base + vdev->shm_size);
 
 	INFO(
-		"axvisor: Written %zu bytes to IVCChannel key [%llx]\n", ret,
+		"axvisor: Written %zd bytes to IVCChannel key [%llx]\n", ret,
 		vdev->key);
 
 	return ret;
@@ -697,9 +688,8 @@ static ssize_t axivc_subscriber_read(
 {
 	struct axivc_subscriber_vdev *vdev = file->private_data;
 	void __iomem *mapped_shm_base = vdev->mapped_shm_base;
-	shm_ring_t *ring = (shm_ring_t *)mapped_shm_base;
-	size_t bytes_read = 0;
-	int ret;
+	u64 sequence = 0;
+	ssize_t ret;
 
 	if (!vdev->active)
 	{
@@ -709,29 +699,45 @@ static ssize_t axivc_subscriber_read(
 			vdev->name);
 		return -ENODEV;
 	}
-	if (ring->key != vdev->key)
+	if (count == 0)
+		return 0;
+
+	ret = axivc_region_validate(
+		mapped_shm_base, vdev->shm_size, vdev->publisher_id, vdev->key);
+	if (ret)
 	{
 		ERROR(
-			"axvisor: Shared memory header key mismatch, expected: 0x%llx, "
-			"got: 0x%llx\n",
-			vdev->key, ring->key);
-		return -EINVAL;
+			"axvisor: Shared IVC region validation failed for publisher "
+			"[%lld] key [%llx], error code: %zd\n",
+			vdev->publisher_id, vdev->key, ret);
+		return ret;
 	}
 	INFO(
 		"axvisor: Try to read %ld bytes from IVCChannel ID [%lld] key [%llx]\n",
 		count, vdev->publisher_id, vdev->key);
 
-	ret = shm_ring_dequeue(mapped_shm_base, buf, count, &bytes_read);
+	ret = axivc_region_recv_request_and_ack(
+		mapped_shm_base, buf, count, &sequence);
 	if (ret < 0)
 	{
 		ERROR(
 			"axvisor: Failed to read data from shared ring buffer, error "
-			"code: %d\n",
+			"code: %zd\n",
 			ret);
 		return ret; // Return error code
 	}
+	if (ret > 0)
+	{
+		u64 notify_ret = hvc_notify_channel(
+			vdev->publisher_id, vdev->key, vdev->publisher_id);
+		if (notify_ret)
+			WARNING(
+				"axvisor: Failed to notify IVC publisher after seq %llu, "
+				"error code: %llu\n",
+				sequence, notify_ret);
+	}
 
-	return bytes_read; // Return number of bytes read
+	return ret; // Return number of bytes read
 }
 
 static long

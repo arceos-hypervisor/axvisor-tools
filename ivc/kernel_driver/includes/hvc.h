@@ -6,6 +6,7 @@ enum hvc_fid
 	HIVCSubscribChannel = 4,
 	HIVCUnPublishChannel = 5,
 	HIVCUnSubscribChannel = 6,
+	HIVCNotify = 7,
 };
 
 u64 hvc_call(
@@ -17,3 +18,4 @@ u64 hvc_unpublish_channel(u64 channel_key);
 u64 hvc_subscribe_channel(
 	u64 publisher_id, u64 channel_key, u64 shm_base_ptr, u64 shm_size_ptr);
 u64 hvc_unsubscribe_channel(u64 publisher_id, u64 channel_key);
+u64 hvc_notify_channel(u64 publisher_id, u64 channel_key, u64 target_vm_id);

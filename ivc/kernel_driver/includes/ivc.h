@@ -1,6 +1,6 @@
 #pragma once
 
-#include <stddef.h>
+#include <linux/types.h>
 
 #include <ivc/ioctl_args.h>
 #include <ivc/ivc_dev.h>

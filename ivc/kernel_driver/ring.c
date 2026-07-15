@@ -1,116 +1,176 @@
-#include <linux/io.h>
-#include <linux/uaccess.h>
+#include <linux/build_bug.h>
+#include <linux/compiler.h>
+#include <linux/errno.h>
+#include <linux/string.h>
 
 #include "includes/ring.h"
 #include "includes/utils.h"
 
+static inline struct axivc_ring *axivc_publisher_to_subscriber_ring(void *base)
+{
+	return &((struct axivc_region *)base)->publisher_to_subscriber;
+}
+
+static inline struct axivc_ring *axivc_subscriber_to_publisher_ring(void *base)
+{
+	return &((struct axivc_region *)base)->subscriber_to_publisher;
+}
+
+static int axivc_ring_send(
+	struct axivc_ring *ring, u32 kind, u64 sequence, const u8 *payload,
+	size_t payload_len)
+{
+	struct axivc_message_slot *slot;
+	u32 head;
+	u32 tail;
+	u32 slot_index;
+	size_t len;
+
+	tail = READ_ONCE(ring->tail);
+	head = smp_load_acquire(&ring->head);
+	if ((u32)(tail - head) >= AXIVC_RING_CAPACITY)
+		return -EAGAIN;
+
+	slot_index = tail % AXIVC_RING_CAPACITY;
+	slot = &ring->slots[slot_index];
+	len = min_t(size_t, payload_len, AXIVC_SLOT_PAYLOAD_SIZE);
+	memcpy(slot->payload, payload, len);
+	if (len < AXIVC_SLOT_PAYLOAD_SIZE)
+		memset(slot->payload + len, 0, AXIVC_SLOT_PAYLOAD_SIZE - len);
+	WRITE_ONCE(slot->sequence, sequence);
+	WRITE_ONCE(slot->len, len);
+	WRITE_ONCE(slot->kind, kind);
+	smp_store_release(&ring->tail, tail + 1);
+	return 0;
+}
+
+static int axivc_ring_recv(
+	struct axivc_ring *ring, u32 expected_kind, char __user *buf, size_t count,
+	u64 *sequence, size_t *out_len)
+{
+	struct axivc_message_slot *slot;
+	u32 head;
+	u32 tail;
+	u32 slot_index;
+	u32 raw_kind;
+	size_t len;
+
+	head = READ_ONCE(ring->head);
+	tail = smp_load_acquire(&ring->tail);
+	if (head == tail)
+		return 0;
+
+	slot_index = head % AXIVC_RING_CAPACITY;
+	slot = &ring->slots[slot_index];
+	raw_kind = READ_ONCE(slot->kind);
+	if (raw_kind != expected_kind)
+		return -EPROTO;
+
+	len = min_t(size_t, READ_ONCE(slot->len), AXIVC_SLOT_PAYLOAD_SIZE);
+	len = min_t(size_t, len, count);
+	if (copy_to_user(buf, slot->payload, len))
+		return -EFAULT;
+
+	*sequence = READ_ONCE(slot->sequence);
+	*out_len = len;
+	smp_store_release(&ring->head, head + 1);
+	return 1;
+}
+
+static int axivc_check_layout(void)
+{
+	BUILD_BUG_ON(sizeof(struct axivc_region_header) != 32);
+	BUILD_BUG_ON(sizeof(struct axivc_message_slot) != 64);
+	BUILD_BUG_ON(sizeof(struct axivc_ring) != 1088);
+	BUILD_BUG_ON(offsetof(struct axivc_region, publisher_to_subscriber) != 64);
+	BUILD_BUG_ON(offsetof(struct axivc_region, subscriber_to_publisher) != 1152);
+	BUILD_BUG_ON(sizeof(struct axivc_region) != 2240);
+	return 0;
+}
+
+int axivc_region_validate(
+	void *base, size_t shm_region_size, u64 publisher_id, u64 channel_key)
+{
+	struct axivc_region *region = base;
+	struct axivc_region_header *header = &region->header;
+
+	axivc_check_layout();
+	if (shm_region_size < sizeof(struct axivc_region))
+		return -EINVAL;
+	if (READ_ONCE(region->publisher_id) != publisher_id ||
+		READ_ONCE(region->key) != channel_key)
+		return -EINVAL;
+	if (smp_load_acquire(&header->magic) != AXIVC_REGION_MAGIC)
+		return -EAGAIN;
+	if (smp_load_acquire(&header->version) != AXIVC_REGION_VERSION)
+		return -EPROTO;
+	if (READ_ONCE(header->region_size) < sizeof(struct axivc_region))
+		return -EPROTO;
+	if (!(READ_ONCE(header->features) & AXIVC_REGION_FEATURE_SPSC_FIXED_SLOTS))
+		return -EPROTO;
+	if (READ_ONCE(header->publisher_to_subscriber_offset) !=
+		offsetof(struct axivc_region, publisher_to_subscriber))
+		return -EPROTO;
+	if (READ_ONCE(header->subscriber_to_publisher_offset) !=
+		offsetof(struct axivc_region, subscriber_to_publisher))
+		return -EPROTO;
+	if (READ_ONCE(header->ring_size) != sizeof(struct axivc_ring))
+		return -EPROTO;
+	return 0;
+}
+
+ssize_t axivc_region_recv_request_and_ack(
+	void *base, char __user *buf, size_t count, u64 *sequence)
+{
+	static const u8 ack[] = "ack from linux subscriber";
+	struct axivc_ring *rx = axivc_publisher_to_subscriber_ring(base);
+	struct axivc_ring *tx = axivc_subscriber_to_publisher_ring(base);
+	size_t bytes_read = 0;
+	int ret;
+
+	ret = axivc_ring_recv(
+		rx, AXIVC_MESSAGE_KIND_REQUEST, buf, count, sequence, &bytes_read);
+	if (ret <= 0)
+		return ret;
+
+	ret = axivc_ring_send(
+		tx, AXIVC_MESSAGE_KIND_ACK, *sequence, ack, sizeof(ack) - 1);
+	if (ret)
+		return ret;
+
+	return bytes_read;
+}
+
 void shm_ring_init(void *shm_base, size_t shm_region_size, uint64_t channel_key)
 {
-	shm_ring_t *ring = (shm_ring_t *)shm_base;
-
-	if (shm_region_size < sizeof(shm_ring_t))
+	if (shm_region_size < sizeof(struct axivc_region))
 	{
 		ERROR(
 			"%s: Shared memory region size is too small: %zu bytes, "
 			"minimum required is %zu bytes\n",
-			__func__, shm_region_size, sizeof(shm_ring_t));
+			__func__, shm_region_size, sizeof(struct axivc_region));
 		return;
 	}
 
-	INFO("%s: Channel publisher_id [%llx]\n", __func__, ring->publisher_id);
-
-	if (ring->key != channel_key)
-	{
-		ERROR(
-			"%s: Channel key mismatch: expected 0x%llx, got 0x%llx\n", __func__,
-			channel_key, ring->key);
-	}
-
-	// DO NOT NEED TO Initialize the ring buffer structure, hypervisor has done
-	// it.
-	// memset(shm_base, 0, shm_region_size);
-
-	ring->head = 0;
-	ring->tail = 0;
-	ring->size = shm_region_size - sizeof(shm_ring_t);
-	ring->data_offset = sizeof(shm_ring_t);
-}
-
-static inline uint8_t *shm_ring_data_ptr(void *base)
-{
-	shm_ring_t *ring = (shm_ring_t *)base;
-	return (uint8_t *)base + ring->data_offset;
-}
-
-// Helper: compute available space
-static inline size_t shm_ring_free_space(shm_ring_t *r)
-{
-	if (r->tail >= r->head)
-		return r->size - (r->tail - r->head) - 1;
-	else
-		return r->head - r->tail - 1;
-}
-
-/// @brief Calculate the used space in the shared memory ring buffer.
-static inline size_t shm_ring_used_space(shm_ring_t *r)
-{
-	if (r->tail >= r->head)
-		return r->tail - r->head;
-	else
-		return r->size - (r->head - r->tail);
+	if (axivc_region_validate(shm_base, shm_region_size, 0, channel_key))
+		WARNING("%s: axivc v2 publisher-side init is not implemented\n", __func__);
 }
 
 size_t shm_ring_enqueue(void *base, const char __user *data, size_t len)
 {
-	shm_ring_t *ring = (shm_ring_t *)base;
-	uint8_t *buf = shm_ring_data_ptr(base);
-	size_t ret = 0;
+	u8 payload[AXIVC_SLOT_PAYLOAD_SIZE];
+	size_t payload_len = min_t(size_t, len, AXIVC_SLOT_PAYLOAD_SIZE);
+	int ret;
 
-	size_t tail = ring->tail;
+	if (copy_from_user(payload, data, payload_len))
+		return -EFAULT;
 
-	// Check if the ring buffer has enough space to enqueue the data.
-	if (len > ring->size || len > shm_ring_free_space(ring))
-	{
-		ERROR(
-			"%s: Not enough space in the ring buffer to enqueue %zu bytes, "
-			"available space: %zu bytes\n",
-			__func__, len, shm_ring_free_space(ring));
-		return -EAGAIN;
-	}
-
-	// Copy data from user space to the ring buffer.
-	if (tail + len <= ring->size)
-	{
-		// write data
-		ret = copy_from_user(buf + tail, data, len);
-		if (ret < 0)
-			goto fail;
-		ring->tail = (tail + len) % ring->size;
-	}
-	else
-	{
-		// wrap-around: write in two parts
-		size_t first_part = ring->size - tail;
-		ret = copy_from_user(buf + tail, data, first_part);
-		if (ret < 0)
-			goto fail;
-		// Copy the second part
-		ret = copy_from_user(
-			buf, (const uint8_t *)data + first_part, len - first_part);
-		if (ret < 0)
-			goto fail;
-		// Update the tail pointer
-		ring->tail = (len - first_part);
-	}
-
-	ret = len;
-	return ret;
-
-fail:
-	ERROR(
-		"%s: Failed to copy data from user space, error code: %ld\n", __func__,
-		ret);
-	return ret;
+	ret = axivc_ring_send(
+		axivc_publisher_to_subscriber_ring(base), AXIVC_MESSAGE_KIND_REQUEST, 0,
+		payload, payload_len);
+	if (ret)
+		return ret;
+	return payload_len;
 }
 
 /// @brief Dequeue data from the shared memory ring buffer.
@@ -124,54 +184,12 @@ fail:
 int shm_ring_dequeue(
 	void *base, char __user *buf, size_t count, size_t *out_len)
 {
-	shm_ring_t *ring = (shm_ring_t *)base;
-	uint8_t *data_buf = shm_ring_data_ptr(base);
-	size_t len;
-	int ret = 0;
+	u64 sequence = 0;
+	ssize_t ret;
 
-	size_t head = ring->head;
-	size_t tail = ring->tail;
-
-	size_t used = shm_ring_used_space(ring);
-
-	if (head == tail)
-		return false; // empty
-
-	// Calculate how much to read
-	len = used;
-	if (count > 0 && count < len)
-		len = count;
-
-	// Copy data from the ring buffer to the user space buffer
-	if (head + len <= ring->size)
-	{
-		// No wrap-around
-		ret = copy_to_user(buf, data_buf + head, len);
-		if (ret)
-			goto fail;
-		ring->head = (head + len) % ring->size;
-	}
-	else
-	{
-		// Wrap-around: read in two parts
-		size_t first_part = ring->size - head;
-		ret = copy_to_user(buf, data_buf + head, first_part);
-		if (ret)
-			goto fail;
-		// Copy the second part
-		ret = copy_to_user(buf + first_part, data_buf, len - first_part);
-		if (ret)
-			goto fail;
-		// Update the head pointer
-		ring->head = (len - first_part);
-	}
-
-	*out_len = len;
-	return ret;
-
-fail:
-	ERROR(
-		"%s: Failed to copy data to user space, error code: %d\n", __func__,
-		ret);
-	return ret;
+	ret = axivc_region_recv_request_and_ack(base, buf, count, &sequence);
+	if (ret < 0)
+		return ret;
+	*out_len = ret;
+	return 0;
 }

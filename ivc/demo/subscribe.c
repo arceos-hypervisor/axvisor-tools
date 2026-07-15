@@ -1,15 +1,23 @@
 #include <ivc/ulib.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 char message[1024];
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <target_publisher_id> <channel_key>\n", argv[0]);
+    unsigned long target_count = 5;
+    unsigned long received = 0;
+    unsigned long empty_polls = 0;
+
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "Usage: %s <target_publisher_id> <channel_key> [message_count]\n", argv[0]);
         return 1;
     }
     uint64_t target_publisher_id = strtoull(argv[1], NULL, 0);
     uint64_t channel_key = strtoull(argv[2], NULL, 0);
+    if (argc == 4) {
+        target_count = strtoul(argv[3], NULL, 0);
+    }
 
     int ret = 0;
 
@@ -26,25 +34,28 @@ int main(int argc, char *argv[]) {
         goto close_manager;
     }
 
-    while (1) {
+    while (received < target_count) {
         int bytes_read = ivc_read(subscriber, message, sizeof(message) - 1);
         if (bytes_read < 0) {
             fprintf(stderr, "Failed to read from subscriber\n");
             ret = 2;
             break;
         } else if (bytes_read == 0) {
-            printf("No data to read, waiting...\n");
+            if (++empty_polls > 200000) {
+                fprintf(stderr, "Timed out waiting for IVC messages\n");
+                ret = 5;
+                break;
+            }
+            usleep(10000);
         } else {
             message[bytes_read] = '\0'; // Null-terminate the string
-            printf("Read from subscriber: %s\n", message);
+            received++;
+            empty_polls = 0;
+            printf("linux ivc recv %lu/%lu: %s\n", received, target_count, message);
         }
-
-        printf("Total bytes read: %lu, press <q> to exit, any other key to continue.\n", subscriber->read);
-        int c = getchar();
-        if (c == 'q' || c == 'Q') {
-            printf("Exiting subscriber loop.\n");
-            break;
-        }
+    }
+    if (ret == 0) {
+        printf("linux ivc demo pass\n");
     }
 
     if (ivc_unsubscribe(subscriber) < 0) {
