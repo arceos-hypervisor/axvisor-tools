@@ -15,7 +15,8 @@ u64 hvc_call(
 	register u64 reg_x5 asm("x5") = arg4;
 	register u64 reg_x6 asm("x6") = arg5;
 
-	asm volatile("hvc #0"
+	asm volatile("hvc #0\n"
+				 "nop"
 				 : "+r"(reg_x0)
 				 : "r"(reg_x1), "r"(reg_x2), "r"(reg_x3), "r"(reg_x4),
 				   "r"(reg_x5), "r"(reg_x6)

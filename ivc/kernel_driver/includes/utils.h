@@ -22,6 +22,7 @@
 #define MSR(reg, var) asm volatile("msr " #reg ", %0\n\r" ::"r"(var))
 
 #define PAR_MASK (0x0000FFFFFFFFF000)
+#define PAR_F (1ULL << 0)
 
 static inline u64 kva2pa(u64 va)
 {
@@ -30,6 +31,8 @@ static inline u64 kva2pa(u64 va)
 	asm volatile("AT S1E1W, %0" ::"r"(va));
 	MRS(par, PAR_EL1);
 	MSR(PAR_EL1, par_saved);
+	if (par & PAR_F)
+		return ~0ULL;
 
 	return (par & PAR_MASK) | (((uint64_t)va) & (0x1000 - 1));
 }

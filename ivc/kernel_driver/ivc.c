@@ -1,4 +1,5 @@
 #include <asm/cacheflush.h>
+#include <asm/memory.h>
 #include <asm/tlbflush.h>
 #include <linux/fs.h>
 #include <linux/io.h>
@@ -54,6 +55,12 @@ static int sub_vdev_count = 0;
 static DEFINE_MUTEX(sub_vdev_lock);
 static LIST_HEAD(sub_vdev_list_head);
 static int next_sub_vdev_id = 0;
+
+struct axivc_hvc_output
+{
+	u64 shm_base;
+	u64 shm_size;
+};
 
 /**
  * @brief Read operation for the axvisor IVC publisher device.
@@ -163,22 +170,41 @@ int ivc_publish_channel(
 	int id;
 	uint64_t shm_base = 0;
 	uint64_t shm_size = expected_shm_size;
+	uint64_t shm_base_ptr;
+	uint64_t shm_size_ptr;
 	struct axivc_publisher_vdev *vdev;
 	void __iomem *mapped_shm_base;
+	struct axivc_hvc_output *hvc_output;
 
 	INFO(
 		"axvisor: Initializing IVC channel with key: 0x%llx, expected size "
 		"0x%llx\n",
 		channel_key, expected_shm_size);
 
+	hvc_output = kzalloc(sizeof(*hvc_output), GFP_KERNEL);
+	if (!hvc_output)
+		return -ENOMEM;
+	hvc_output->shm_size = expected_shm_size;
+	shm_base_ptr = kva2pa((u64)&hvc_output->shm_base);
+	shm_size_ptr = kva2pa((u64)&hvc_output->shm_size);
+	if (shm_base_ptr == ~0ULL || shm_size_ptr == ~0ULL)
+	{
+		ERROR("axvisor: Failed to translate IVC publish output buffer\n");
+		kfree(hvc_output);
+		return -EFAULT;
+	}
+
 	// Call the hypervisor to publish the channel
-	ret = hvc_publish_channel(
-		(u64)channel_key, kva2pa((u64)&shm_base), kva2pa((u64)&shm_size));
+	ret = hvc_publish_channel((u64)channel_key, shm_base_ptr, shm_size_ptr);
 	if (ret != 0)
 	{
 		ERROR("axvisor: Failed to publish channel, error code: %d\n", ret);
+		kfree(hvc_output);
 		return -EIO;
 	}
+	shm_base = hvc_output->shm_base;
+	shm_size = hvc_output->shm_size;
+	kfree(hvc_output);
 
 	INFO(
 		"axvisor: IVC publish channel allocated successfully, base: 0x%llx, "
@@ -192,6 +218,7 @@ int ivc_publish_channel(
 	if (!mapped_shm_base)
 	{
 		ERROR("axvisor: Failed to map shared memory base\n");
+		hvc_unpublish_channel(channel_key);
 		return -ENOMEM;
 	}
 
@@ -343,19 +370,37 @@ int ivc_subscribe_channel(u64 publisher_id, u64 key, char *sub_dev_name)
 	int id;
 	uint64_t shm_base = 0;
 	uint64_t shm_size = 0;
+	uint64_t shm_base_ptr;
+	uint64_t shm_size_ptr;
 	struct axivc_subscriber_vdev *vdev;
 	void __iomem *mapped_shm_base;
+	struct axivc_hvc_output *hvc_output;
 
 	INFO("axvisor: Subscribing to IVC channel with key: 0x%llx\n", key);
 
+	hvc_output = kzalloc(sizeof(*hvc_output), GFP_KERNEL);
+	if (!hvc_output)
+		return -ENOMEM;
+	shm_base_ptr = kva2pa((u64)&hvc_output->shm_base);
+	shm_size_ptr = kva2pa((u64)&hvc_output->shm_size);
+	if (shm_base_ptr == ~0ULL || shm_size_ptr == ~0ULL)
+	{
+		ERROR("axvisor: Failed to translate IVC subscribe output buffer\n");
+		kfree(hvc_output);
+		return -EFAULT;
+	}
+
 	// Call the hypervisor to subscribe to the channel
-	ret = hvc_subscribe_channel(
-		publisher_id, key, kva2pa((u64)&shm_base), kva2pa((u64)&shm_size));
+	ret = hvc_subscribe_channel(publisher_id, key, shm_base_ptr, shm_size_ptr);
 	if (ret != 0)
 	{
 		ERROR("axvisor: Failed to subscribe to channel, error code: %d\n", ret);
+		kfree(hvc_output);
 		return -EIO;
 	}
+	shm_base = hvc_output->shm_base;
+	shm_size = hvc_output->shm_size;
+	kfree(hvc_output);
 
 	INFO(
 		"axvisor: IVC subscribtion channel init successfully, base: 0x%llx, "
@@ -369,6 +414,7 @@ int ivc_subscribe_channel(u64 publisher_id, u64 key, char *sub_dev_name)
 	if (!mapped_shm_base)
 	{
 		ERROR("axvisor: Failed to map shared memory base\n");
+		hvc_unsubscribe_channel(publisher_id, key);
 		return -ENOMEM;
 	}
 	ret = axivc_region_validate(mapped_shm_base, shm_size, publisher_id, key);
@@ -379,6 +425,7 @@ int ivc_subscribe_channel(u64 publisher_id, u64 key, char *sub_dev_name)
 			"code: %d\n",
 			ret);
 		iounmap(mapped_shm_base);
+		hvc_unsubscribe_channel(publisher_id, key);
 		return ret;
 	}
 	mutex_lock(&sub_vdev_lock);
