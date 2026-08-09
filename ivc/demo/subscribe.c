@@ -35,9 +35,9 @@ int main(int argc, char *argv[]) {
     }
 
     while (received < target_count) {
-        int bytes_read = ivc_read(subscriber, message, sizeof(message) - 1);
+        int bytes_read = ivc_subscriber_recv(subscriber, message, sizeof(message) - 1);
         if (bytes_read < 0) {
-            fprintf(stderr, "Failed to read from subscriber\n");
+            fprintf(stderr, "Failed to receive on subscriber\n");
             ret = 2;
             break;
         } else if (bytes_read == 0) {
