@@ -25,13 +25,7 @@ class ManagerPointerManager
 	~ManagerPointerManager()
 	{
 		if (manager)
-		{
-			if (ivc_close_manager(manager) < 0)
-			{
-				py::set_error(
-					PyExc_RuntimeError, "Failed to close IVC manager");
-			}
-		}
+			(void)ivc_close_manager(manager);
 	}
 
 	ivc_manager_p get_manager() const { return manager; }
@@ -70,21 +64,12 @@ class Subscriber
 		}
 	}
 
-	~Subscriber()
-	{
-		if (ivc_unsubscribe(subscriber) < 0)
-		{
-			py::set_error(
-				PyExc_RuntimeError, "Failed to unsubscribe from channel");
-		}
-	}
+	~Subscriber() { (void)ivc_unsubscribe(subscriber); }
 
 	py::bytes recv(size_t max_bytes)
 	{
 		if (max_bytes == 0)
-		{
-			return py::bytes();
-		}
+			throw py::value_error("max_bytes must be greater than zero");
 
 		std::vector<char> buffer(max_bytes);
 		int bytes_received =
@@ -138,20 +123,12 @@ class Publisher
 		}
 	}
 
-	~Publisher()
-	{
-		if (ivc_unpublish(publisher) < 0)
-		{
-			py::set_error(PyExc_RuntimeError, "Failed to unpublish channel");
-		}
-	}
+	~Publisher() { (void)ivc_unpublish(publisher); }
 
 	py::bytes recv(size_t max_bytes)
 	{
 		if (max_bytes == 0)
-		{
-			return py::bytes();
-		}
+			throw py::value_error("max_bytes must be greater than zero");
 
 		std::vector<char> buffer(max_bytes);
 		int bytes_received =

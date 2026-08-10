@@ -42,20 +42,28 @@ ivc_manager_p ivc_open_manager(void)
 
 int ivc_close_manager(ivc_manager_p manager)
 {
+	int saved_errno = 0;
+
 	// Check if the manager is valid
 	if (!ivc_manager_is_valid(manager))
 	{
+		errno = EINVAL;
 		fprintf(stderr, "Invalid IVC manager for close\n");
 		return -1;
 	}
-	// Close the IVC device
+	// Free the manager even when close reports an error: on Linux the file
+	// descriptor is released before a late close error is returned.
 	if (close(manager->fd) < 0)
 	{
+		saved_errno = errno;
 		perror("Failed to close IVC device");
+	}
+	free(manager);
+	if (saved_errno)
+	{
+		errno = saved_errno;
 		return -1;
 	}
-	// Free the manager memory
-	free(manager);
 	return 0;
 }
 
@@ -118,14 +126,16 @@ ivc_subscriber_p ivc_subscribe(
 int ivc_subscriber_recv(
 	ivc_subscriber_p subscriber, void *buf, size_t count)
 {
-	if (count == 0)
+	if (!subscriber || !buf || count == 0)
 	{
-		return 0; // Nothing to receive
-	}
-
-	if (!subscriber || !buf)
-	{
+		errno = EINVAL;
 		fprintf(stderr, "Invalid arguments for ivc_subscriber_recv\n");
+		return -1;
+	}
+	if (count > INT_MAX)
+	{
+		errno = EMSGSIZE;
+		fprintf(stderr, "Subscriber receive buffer is too large\n");
 		return -1;
 	}
 
@@ -185,31 +195,38 @@ int ivc_subscriber_send(
 
 int ivc_unsubscribe(ivc_subscriber_p subscriber)
 {
+	int result = 0;
+	int saved_errno = 0;
+
 	if (!subscriber)
 	{
+		errno = EINVAL;
 		fprintf(stderr, "Invalid subscriber for ivc_unsubscribe\n");
 		return -1;
 	}
 
-	// Close the subscriber device
+	// Attempt every cleanup step even if an earlier one fails.
 	if (close(subscriber->fd) < 0)
 	{
+		saved_errno = errno;
 		perror("Failed to close subscriber device");
-		return -1;
+		result = -1;
 	}
 
-	// Perform the unsubscribe operation
 	if (ioctl(
 			subscriber->manager->fd, IVC_UNSUBSCRIBE_CHANNEL,
 			&subscriber->subscribe_arg) < 0)
 	{
+		if (!saved_errno)
+			saved_errno = errno;
 		perror("Failed to unsubscribe from channel");
-		return -1;
+		result = -1;
 	}
 
-	// Free the subscriber memory
 	free(subscriber);
-	return 0;
+	if (result < 0)
+		errno = saved_errno;
+	return result;
 }
 
 ivc_publisher_p
@@ -267,13 +284,16 @@ ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_t channel_size)
 
 int ivc_publisher_recv(ivc_publisher_p publisher, void *buf, size_t count)
 {
-	if (count == 0)
+	if (!publisher || !buf || count == 0)
 	{
-		return 0;
-	}
-	if (!publisher || !buf)
-	{
+		errno = EINVAL;
 		fprintf(stderr, "Invalid arguments for ivc_publisher_recv\n");
+		return -1;
+	}
+	if (count > INT_MAX)
+	{
+		errno = EMSGSIZE;
+		fprintf(stderr, "Publisher receive buffer is too large\n");
 		return -1;
 	}
 
@@ -333,29 +353,36 @@ int ivc_publisher_send(
 
 int ivc_unpublish(ivc_publisher_p publisher)
 {
+	int result = 0;
+	int saved_errno = 0;
+
 	if (!publisher)
 	{
+		errno = EINVAL;
 		fprintf(stderr, "Invalid publisher for ivc_unpublish\n");
 		return -1;
 	}
 
-	// Close the publisher device
+	// Attempt every cleanup step even if an earlier one fails.
 	if (close(publisher->fd) < 0)
 	{
+		saved_errno = errno;
 		perror("Failed to close publisher device");
-		return -1;
+		result = -1;
 	}
 
-	// Perform the unpublish operation
 	if (ioctl(
 			publisher->manager->fd, IVC_UNPUBLISH_CHANNEL,
 			&publisher->publish_arg) < 0)
 	{
+		if (!saved_errno)
+			saved_errno = errno;
 		perror("Failed to unpublish channel");
-		return -1;
+		result = -1;
 	}
 
-	// Free the publisher memory
 	free(publisher);
-	return 0;
+	if (result < 0)
+		errno = saved_errno;
+	return result;
 }

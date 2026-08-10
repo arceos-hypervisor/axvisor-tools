@@ -31,8 +31,9 @@ extern "C"
 
 	ivc_subscriber_p ivc_subscribe(
 		ivc_manager_p manager, uint64_t publisher_id, uint64_t channel_key);
-	// Receives one complete logical message. Returns the message length, 0 when
-	// no message is available, or a negative value on error.
+	// Receives one complete logical message. count must be nonzero. Returns the
+	// message length, 0 when no message is available, or a negative value on
+	// error.
 	int
 	ivc_subscriber_recv(ivc_subscriber_p subscriber, void *buf, size_t count);
 	// Sends one complete logical message. Empty messages are not supported by
@@ -52,8 +53,9 @@ extern "C"
 
 	ivc_publisher_p ivc_publish(
 		ivc_manager_p manager, uint64_t channel_key, uint64_t channel_size);
-	// Receives one complete logical message. Returns the message length, 0 when
-	// no message is available, or a negative value on error.
+	// Receives one complete logical message. count must be nonzero. Returns the
+	// message length, 0 when no message is available, or a negative value on
+	// error.
 	int ivc_publisher_recv(ivc_publisher_p publisher, void *buf, size_t count);
 	// Sends one complete logical message. Empty messages are not supported by
 	// the POSIX read/write device adapter.

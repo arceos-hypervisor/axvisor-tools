@@ -90,7 +90,9 @@ int axivc_region_validate(
 		return -EPROTO;
 	if (READ_ONCE(header->region_size) < sizeof(struct axivc_region))
 		return -EPROTO;
-	if (READ_ONCE(header->features) != AXIVC_REGION_FEATURE_SPSC_OPAQUE_CELLS)
+	if ((READ_ONCE(header->features) &
+		 AXIVC_REGION_FEATURE_SPSC_OPAQUE_CELLS) !=
+		AXIVC_REGION_FEATURE_SPSC_OPAQUE_CELLS)
 		return -EPROTO;
 	if (READ_ONCE(header->publisher_to_subscriber_offset) !=
 		offsetof(struct axivc_region, publisher_to_subscriber))

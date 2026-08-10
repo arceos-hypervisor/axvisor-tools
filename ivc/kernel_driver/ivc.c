@@ -617,7 +617,7 @@ static ssize_t axivc_recv_message(
 		if (msleep_interruptible(AXIVC_POLL_INTERVAL_MS))
 		{
 			ret = -ERESTARTSYS;
-			axivc_message_receiver_poison(rx, -EPIPE);
+			axivc_message_receiver_poison(rx, ret);
 			goto unlock;
 		}
 	}
