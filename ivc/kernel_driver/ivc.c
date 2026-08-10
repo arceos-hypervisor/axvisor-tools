@@ -1,6 +1,7 @@
 #include <asm/cacheflush.h>
 #include <asm/memory.h>
 #include <asm/tlbflush.h>
+#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/io.h>
 #include <linux/list.h>
@@ -15,6 +16,9 @@
 #include "includes/ring.h"
 #include "includes/utils.h"
 
+
+#define AXIVC_REGION_READY_RETRIES 100
+#define AXIVC_REGION_READY_DELAY_MS 10
 
 struct axivc_publisher_vdev
 {
@@ -61,6 +65,25 @@ struct axivc_hvc_output
 	u64 shm_base;
 	u64 shm_size;
 };
+
+static int ivc_wait_for_region_ready(
+	void __iomem *mapped_shm_base, uint64_t shm_size, uint64_t publisher_id,
+	uint64_t key)
+{
+	int attempt;
+	int ret;
+
+	for (attempt = 0; attempt < AXIVC_REGION_READY_RETRIES; attempt++)
+	{
+		ret = axivc_region_validate(
+			mapped_shm_base, shm_size, publisher_id, key);
+		if (ret != -EAGAIN)
+			return ret;
+		msleep(AXIVC_REGION_READY_DELAY_MS);
+	}
+
+	return -EAGAIN;
+}
 
 /**
  * @brief Read operation for the axvisor IVC publisher device.
@@ -417,7 +440,8 @@ int ivc_subscribe_channel(u64 publisher_id, u64 key, char *sub_dev_name)
 		hvc_unsubscribe_channel(publisher_id, key);
 		return -ENOMEM;
 	}
-	ret = axivc_region_validate(mapped_shm_base, shm_size, publisher_id, key);
+	ret = ivc_wait_for_region_ready(
+		mapped_shm_base, shm_size, publisher_id, key);
 	if (ret)
 	{
 		ERROR(
