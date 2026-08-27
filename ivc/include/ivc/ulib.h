@@ -10,14 +10,17 @@ extern "C"
 {
 #endif
 
-	// TODO: record publishers and subscribers created and recycle them when
-	// close the IVC manager.
 	typedef struct ivc_manager
 	{
 		int64_t fd; // File descriptor for the IVC device
+		uint64_t
+			active_endpoints; // Publishers and subscribers using this manager
 	} ivc_manager_t, *ivc_manager_p;
 
 	ivc_manager_p ivc_open_manager(void);
+	// Returns EBUSY without consuming manager while endpoints remain.
+	// Otherwise, consumes manager even when closing its device reports an
+	// error.
 	int ivc_close_manager(ivc_manager_p manager);
 
 	typedef struct ivc_subscriber
@@ -40,6 +43,7 @@ extern "C"
 	// the POSIX read/write device adapter.
 	int ivc_subscriber_send(
 		ivc_subscriber_p subscriber, const void *buf, size_t count);
+	// Always consumes subscriber and attempts local and manager cleanup.
 	int ivc_unsubscribe(ivc_subscriber_p subscriber);
 
 	typedef struct ivc_publisher
@@ -61,6 +65,7 @@ extern "C"
 	// the POSIX read/write device adapter.
 	int ivc_publisher_send(
 		ivc_publisher_p publisher, const void *buf, size_t count);
+	// Always consumes publisher and attempts local and manager cleanup.
 	int ivc_unpublish(ivc_publisher_p publisher);
 
 #ifdef __cplusplus

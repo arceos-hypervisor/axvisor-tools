@@ -10,31 +10,45 @@
 #include <string.h>
 #include <unistd.h>
 
-int ivc_manager_is_valid(ivc_manager_p manager)
+static int ivc_manager_is_valid(ivc_manager_p manager)
 {
-	// Check if the manager is valid
-	if (!manager || (manager->fd < 0))
+	return manager && manager->fd >= 0;
+}
+
+static int
+ivc_manager_release_endpoint(ivc_manager_p manager, const char *operation)
+{
+	if (!manager || manager->active_endpoints == 0)
 	{
-		return 0;
+		errno = EINVAL;
+		fprintf(
+			stderr, "IVC manager endpoint count underflow during %s\n",
+			operation);
+		return -1;
 	}
-	return 1;
+	manager->active_endpoints--;
+	return 0;
 }
 
 ivc_manager_p ivc_open_manager(void)
 {
-	// Allocate memory for the IVC manager
-	ivc_manager_p manager = malloc(sizeof(ivc_manager_t));
+	ivc_manager_p manager = malloc(sizeof(*manager));
+
 	if (!manager)
 	{
 		perror("Failed to allocate memory for IVC manager");
 		return NULL;
 	}
-	// Open the IVC device
+
 	manager->fd = open(IVC_DEV_PATH, O_RDWR);
+	manager->active_endpoints = 0;
 	if (manager->fd < 0)
 	{
+		int open_errno = errno;
+
 		perror("Failed to open IVC device");
 		free(manager);
+		errno = open_errno;
 		return NULL;
 	}
 	return manager;
@@ -42,26 +56,34 @@ ivc_manager_p ivc_open_manager(void)
 
 int ivc_close_manager(ivc_manager_p manager)
 {
-	int saved_errno = 0;
+	int close_errno = 0;
 
-	// Check if the manager is valid
 	if (!ivc_manager_is_valid(manager))
 	{
 		errno = EINVAL;
 		fprintf(stderr, "Invalid IVC manager for close\n");
 		return -1;
 	}
-	// Free the manager even when close reports an error: on Linux the file
-	// descriptor is released before a late close error is returned.
+	if (manager->active_endpoints != 0)
+	{
+		errno = EBUSY;
+		fprintf(
+			stderr, "Cannot close IVC manager with %llu active endpoint(s)\n",
+			(unsigned long long)manager->active_endpoints);
+		return -1;
+	}
+
+	/* Linux releases the descriptor before reporting a late close error, so
+	 * the manager allocation is consumed on every non-busy close attempt. */
 	if (close(manager->fd) < 0)
 	{
-		saved_errno = errno;
+		close_errno = errno;
 		perror("Failed to close IVC device");
 	}
 	free(manager);
-	if (saved_errno)
+	if (close_errno)
 	{
-		errno = saved_errno;
+		errno = close_errno;
 		return -1;
 	}
 	return 0;
@@ -70,22 +92,22 @@ int ivc_close_manager(ivc_manager_p manager)
 ivc_subscriber_p ivc_subscribe(
 	ivc_manager_p manager, uint64_t publisher_id, uint64_t channel_key)
 {
-	// Check if the manager is valid
+	ivc_subscriber_p subscriber;
+
 	if (!ivc_manager_is_valid(manager))
 	{
+		errno = EINVAL;
 		fprintf(stderr, "Invalid IVC manager for subscribe\n");
 		return NULL;
 	}
 
-	// Allocate memory for the subscriber
-	ivc_subscriber_p subscriber = malloc(sizeof(ivc_subscriber_t));
+	subscriber = malloc(sizeof(*subscriber));
 	if (!subscriber)
 	{
 		perror("Failed to allocate memory for subscriber");
 		return NULL;
 	}
 
-	// Set up the subscriber structure
 	subscriber->manager = manager;
 	subscriber->subscribe_arg.target_publisher_id = publisher_id;
 	subscriber->subscribe_arg.channel_key = channel_key;
@@ -95,19 +117,22 @@ ivc_subscriber_p ivc_subscribe(
 	subscriber->bytes_received = 0;
 	subscriber->bytes_sent = 0;
 
-	// Perform the subscription operation
 	if (ioctl(manager->fd, IVC_SUBSCRIBE_CHANNEL, &subscriber->subscribe_arg) <
 		0)
 	{
+		int subscribe_errno = errno;
+
 		perror("Failed to subscribe to channel");
 		free(subscriber);
+		errno = subscribe_errno;
 		return NULL;
 	}
 
-	// Open the subscriber device
 	subscriber->fd = open(subscriber->subscribe_arg.device_name, O_RDWR);
 	if (subscriber->fd < 0)
 	{
+		int open_errno = errno;
+
 		perror("Failed to open subscriber device");
 		if (ioctl(
 				manager->fd, IVC_UNSUBSCRIBE_CHANNEL,
@@ -117,15 +142,18 @@ ivc_subscriber_p ivc_subscribe(
 				"Failed to roll back subscription after device open failure");
 		}
 		free(subscriber);
+		errno = open_errno;
 		return NULL;
 	}
 
+	manager->active_endpoints++;
 	return subscriber;
 }
 
-int ivc_subscriber_recv(
-	ivc_subscriber_p subscriber, void *buf, size_t count)
+int ivc_subscriber_recv(ivc_subscriber_p subscriber, void *buf, size_t count)
 {
+	int bytes_received;
+
 	if (!subscriber || !buf || count == 0)
 	{
 		errno = EINVAL;
@@ -139,14 +167,14 @@ int ivc_subscriber_recv(
 		return -1;
 	}
 
-	int bytes_received = read(subscriber->fd, buf, count);
+	bytes_received = (int)read(subscriber->fd, buf, count);
 	if (bytes_received < 0)
 	{
 		perror("Failed to receive on subscriber device");
 	}
 	else
 	{
-		subscriber->bytes_received += bytes_received;
+		subscriber->bytes_received += (uint64_t)bytes_received;
 	}
 	return bytes_received;
 }
@@ -154,6 +182,14 @@ int ivc_subscriber_recv(
 int ivc_subscriber_send(
 	ivc_subscriber_p subscriber, const void *buf, size_t count)
 {
+	int bytes_sent;
+
+	if (!subscriber || !buf)
+	{
+		errno = EINVAL;
+		fprintf(stderr, "Invalid arguments for ivc_subscriber_send\n");
+		return -1;
+	}
 	if (count == 0)
 	{
 		errno = EOPNOTSUPP;
@@ -168,15 +204,10 @@ int ivc_subscriber_send(
 		fprintf(stderr, "Subscriber message is too large\n");
 		return -1;
 	}
-	if (!subscriber || !buf)
-	{
-		fprintf(stderr, "Invalid arguments for ivc_subscriber_send\n");
-		return -1;
-	}
 
-	/* One device write is one logical Message V1 message. A short write
-	 * would incorrectly create a second message, so it is an error. */
-	int bytes_sent = write(subscriber->fd, buf, count);
+	/* One device write is one Message V1 message. Retrying a short write
+	 * would create another logical message instead of completing this one. */
+	bytes_sent = (int)write(subscriber->fd, buf, count);
 	if (bytes_sent < 0)
 	{
 		perror("Failed to send on subscriber device");
@@ -184,18 +215,18 @@ int ivc_subscriber_send(
 	}
 	if (bytes_sent != (int)count)
 	{
+		errno = EIO;
 		fprintf(
 			stderr, "Subscriber device returned a short message send: %d/%zu\n",
 			bytes_sent, count);
 		return -1;
 	}
-	subscriber->bytes_sent += bytes_sent;
+	subscriber->bytes_sent += (uint64_t)bytes_sent;
 	return bytes_sent;
 }
 
 int ivc_unsubscribe(ivc_subscriber_p subscriber)
 {
-	int result = 0;
 	int saved_errno = 0;
 
 	if (!subscriber)
@@ -205,49 +236,58 @@ int ivc_unsubscribe(ivc_subscriber_p subscriber)
 		return -1;
 	}
 
-	// Attempt every cleanup step even if an earlier one fails.
+	/* Consume the endpoint only after attempting every independent cleanup
+	 * step. Preserve the first error because it is closest to the root cause.
+	 */
 	if (close(subscriber->fd) < 0)
 	{
 		saved_errno = errno;
 		perror("Failed to close subscriber device");
-		result = -1;
 	}
-
 	if (ioctl(
 			subscriber->manager->fd, IVC_UNSUBSCRIBE_CHANNEL,
 			&subscriber->subscribe_arg) < 0)
 	{
 		if (!saved_errno)
+		{
 			saved_errno = errno;
+		}
 		perror("Failed to unsubscribe from channel");
-		result = -1;
+	}
+	if (ivc_manager_release_endpoint(subscriber->manager, "unsubscribe") < 0 &&
+		!saved_errno)
+	{
+		saved_errno = errno;
 	}
 
 	free(subscriber);
-	if (result < 0)
+	if (saved_errno)
+	{
 		errno = saved_errno;
-	return result;
+		return -1;
+	}
+	return 0;
 }
 
 ivc_publisher_p
 ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_t channel_size)
 {
-	// Check if the manager is valid
+	ivc_publisher_p publisher;
+
 	if (!ivc_manager_is_valid(manager))
 	{
+		errno = EINVAL;
 		fprintf(stderr, "Invalid IVC manager for publish\n");
 		return NULL;
 	}
 
-	// Allocate memory for the publisher
-	ivc_publisher_p publisher = malloc(sizeof(ivc_publisher_t));
+	publisher = malloc(sizeof(*publisher));
 	if (!publisher)
 	{
 		perror("Failed to allocate memory for publisher");
 		return NULL;
 	}
 
-	// Set up the publisher structure
 	publisher->manager = manager;
 	publisher->publish_arg.channel_key = channel_key;
 	publisher->publish_arg.channel_size = channel_size;
@@ -257,18 +297,21 @@ ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_t channel_size)
 	publisher->bytes_received = 0;
 	publisher->bytes_sent = 0;
 
-	// Perform the publish operation
 	if (ioctl(manager->fd, IVC_PUBLISH_CHANNEL, &publisher->publish_arg) < 0)
 	{
+		int publish_errno = errno;
+
 		perror("Failed to publish channel");
 		free(publisher);
+		errno = publish_errno;
 		return NULL;
 	}
 
-	// Open the publisher device
 	publisher->fd = open(publisher->publish_arg.device_name, O_RDWR);
 	if (publisher->fd < 0)
 	{
+		int open_errno = errno;
+
 		perror("Failed to open publisher device");
 		if (ioctl(manager->fd, IVC_UNPUBLISH_CHANNEL, &publisher->publish_arg) <
 			0)
@@ -276,14 +319,18 @@ ivc_publish(ivc_manager_p manager, uint64_t channel_key, uint64_t channel_size)
 			perror("Failed to roll back publication after device open failure");
 		}
 		free(publisher);
+		errno = open_errno;
 		return NULL;
 	}
 
+	manager->active_endpoints++;
 	return publisher;
 }
 
 int ivc_publisher_recv(ivc_publisher_p publisher, void *buf, size_t count)
 {
+	int bytes_received;
+
 	if (!publisher || !buf || count == 0)
 	{
 		errno = EINVAL;
@@ -297,21 +344,28 @@ int ivc_publisher_recv(ivc_publisher_p publisher, void *buf, size_t count)
 		return -1;
 	}
 
-	int bytes_received = read(publisher->fd, buf, count);
+	bytes_received = (int)read(publisher->fd, buf, count);
 	if (bytes_received < 0)
 	{
 		perror("Failed to receive on publisher device");
 	}
 	else
 	{
-		publisher->bytes_received += bytes_received;
+		publisher->bytes_received += (uint64_t)bytes_received;
 	}
 	return bytes_received;
 }
 
-int ivc_publisher_send(
-	ivc_publisher_p publisher, const void *buf, size_t count)
+int ivc_publisher_send(ivc_publisher_p publisher, const void *buf, size_t count)
 {
+	int bytes_sent;
+
+	if (!publisher || !buf)
+	{
+		errno = EINVAL;
+		fprintf(stderr, "Invalid arguments for ivc_publisher_send\n");
+		return -1;
+	}
 	if (count == 0)
 	{
 		errno = EOPNOTSUPP;
@@ -326,15 +380,10 @@ int ivc_publisher_send(
 		fprintf(stderr, "Publisher message is too large\n");
 		return -1;
 	}
-	if (!publisher || !buf)
-	{
-		fprintf(stderr, "Invalid arguments for ivc_publisher_send\n");
-		return -1;
-	}
 
-	/* One device write is one logical Message V1 message. A short write
-	 * would incorrectly create a second message, so it is an error. */
-	int bytes_sent = write(publisher->fd, buf, count);
+	/* One device write is one Message V1 message. Retrying a short write
+	 * would create another logical message instead of completing this one. */
+	bytes_sent = (int)write(publisher->fd, buf, count);
 	if (bytes_sent < 0)
 	{
 		perror("Failed to send on publisher device");
@@ -342,18 +391,18 @@ int ivc_publisher_send(
 	}
 	if (bytes_sent != (int)count)
 	{
+		errno = EIO;
 		fprintf(
 			stderr, "Publisher device returned a short message send: %d/%zu\n",
 			bytes_sent, count);
 		return -1;
 	}
-	publisher->bytes_sent += bytes_sent;
+	publisher->bytes_sent += (uint64_t)bytes_sent;
 	return bytes_sent;
 }
 
 int ivc_unpublish(ivc_publisher_p publisher)
 {
-	int result = 0;
 	int saved_errno = 0;
 
 	if (!publisher)
@@ -363,26 +412,35 @@ int ivc_unpublish(ivc_publisher_p publisher)
 		return -1;
 	}
 
-	// Attempt every cleanup step even if an earlier one fails.
+	/* Consume the endpoint only after attempting every independent cleanup
+	 * step. Preserve the first error because it is closest to the root cause.
+	 */
 	if (close(publisher->fd) < 0)
 	{
 		saved_errno = errno;
 		perror("Failed to close publisher device");
-		result = -1;
 	}
-
 	if (ioctl(
 			publisher->manager->fd, IVC_UNPUBLISH_CHANNEL,
 			&publisher->publish_arg) < 0)
 	{
 		if (!saved_errno)
+		{
 			saved_errno = errno;
+		}
 		perror("Failed to unpublish channel");
-		result = -1;
+	}
+	if (ivc_manager_release_endpoint(publisher->manager, "unpublish") < 0 &&
+		!saved_errno)
+	{
+		saved_errno = errno;
 	}
 
 	free(publisher);
-	if (result < 0)
+	if (saved_errno)
+	{
 		errno = saved_errno;
-	return result;
+		return -1;
+	}
+	return 0;
 }
