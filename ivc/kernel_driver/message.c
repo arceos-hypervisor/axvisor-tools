@@ -19,7 +19,7 @@ struct axivc_receive_transition;
 
 static int axivc_publish_empty_message(
 	struct axivc_message_sender *sender, struct axivc_send_progress *progress);
-static int axivc_process_available_cells(
+static int axivc_process_available_slots(
 	struct axivc_message_receiver *receiver, u8 *output, size_t output_len,
 	struct axivc_receive_progress *progress);
 static int
@@ -73,10 +73,10 @@ int axivc_message_try_write(
 {
 	u64 remaining;
 	size_t consumed = 0;
-	size_t published_cells = 0;
+	size_t published_slots = 0;
 
 	progress->consumed = 0;
-	progress->published_cells = 0;
+	progress->published_slots = 0;
 	progress->complete = false;
 
 	if (!sender->sending)
@@ -91,7 +91,7 @@ int axivc_message_try_write(
 
 	while (consumed < input_len)
 	{
-		u8 cell[AXIVC_CELL_SIZE];
+		u8 slot[AXIVC_SLOT_SIZE];
 		size_t fragment_len =
 			min_t(size_t, AXIVC_FRAGMENT_CAPACITY, input_len - consumed);
 		u64 next_sent = sender->sent + fragment_len;
@@ -99,35 +99,35 @@ int axivc_message_try_write(
 		int err;
 
 		err = axivc_encode_frame(
-			cell, sender->active.id, sender->active.len, !sender->published_any,
+			slot, sender->active.id, sender->active.len, !sender->published_any,
 			complete, false, input + consumed, fragment_len);
 		if (err)
 			return err;
-		if (!axivc_ring_try_push_cell(sender->ring, cell))
+		if (!axivc_ring_try_push_slot(sender->ring, slot))
 			break;
 
 		sender->sent = next_sent;
 		sender->published_any = true;
 		consumed += fragment_len;
-		published_cells += 1;
+		published_slots += 1;
 		if (complete)
 		{
 			sender->sending = false;
 			progress->consumed = consumed;
-			progress->published_cells = published_cells;
+			progress->published_slots = published_slots;
 			progress->complete = true;
 			return 0;
 		}
 	}
 
 	progress->consumed = consumed;
-	progress->published_cells = published_cells;
+	progress->published_slots = published_slots;
 	return 0;
 }
 
 int axivc_message_try_abort(struct axivc_message_sender *sender)
 {
-	u8 cell[AXIVC_CELL_SIZE];
+	u8 slot[AXIVC_SLOT_SIZE];
 	int err;
 
 	if (!sender->sending)
@@ -139,11 +139,11 @@ int axivc_message_try_abort(struct axivc_message_sender *sender)
 	}
 
 	err = axivc_encode_frame(
-		cell, sender->active.id, sender->active.len, false, false, true, NULL,
+		slot, sender->active.id, sender->active.len, false, false, true, NULL,
 		0);
 	if (err)
 		return err;
-	if (!axivc_ring_try_push_cell(sender->ring, cell))
+	if (!axivc_ring_try_push_slot(sender->ring, slot))
 		return -EAGAIN;
 
 	sender->sending = false;
@@ -172,7 +172,7 @@ int axivc_message_peek_meta(
 	struct axivc_message_receiver *receiver, struct axivc_message_meta *meta,
 	bool *available)
 {
-	u8 cell[AXIVC_CELL_SIZE];
+	u8 slot[AXIVC_SLOT_SIZE];
 	struct axivc_decoded_frame frame;
 	int err;
 
@@ -186,9 +186,9 @@ int axivc_message_peek_meta(
 		return 0;
 	}
 
-	if (!axivc_ring_try_peek_cell(receiver->ring, cell))
+	if (!axivc_ring_try_peek_slot(receiver->ring, slot))
 		return 0;
-	err = axivc_decode_frame(cell, &frame);
+	err = axivc_decode_frame(slot, &frame);
 	if (err)
 		return axivc_receiver_fail(receiver, err);
 	if (frame.abort || !frame.first)
@@ -204,7 +204,7 @@ int axivc_message_try_read(
 	struct axivc_message_receiver *receiver, u8 *output, size_t output_len,
 	struct axivc_receive_progress *progress)
 {
-	return axivc_process_available_cells(
+	return axivc_process_available_slots(
 		receiver, output, output_len, progress);
 }
 
@@ -225,30 +225,30 @@ struct axivc_receive_transition
 static int axivc_publish_empty_message(
 	struct axivc_message_sender *sender, struct axivc_send_progress *progress)
 {
-	u8 cell[AXIVC_CELL_SIZE];
+	u8 slot[AXIVC_SLOT_SIZE];
 	int err = axivc_encode_frame(
-		cell, sender->active.id, 0, true, true, false, NULL, 0);
+		slot, sender->active.id, 0, true, true, false, NULL, 0);
 
 	if (err)
 		return err;
-	if (!axivc_ring_try_push_cell(sender->ring, cell))
+	if (!axivc_ring_try_push_slot(sender->ring, slot))
 		return 0;
 
 	sender->sending = false;
-	progress->published_cells = 1;
+	progress->published_slots = 1;
 	progress->complete = true;
 	return 0;
 }
 
-static int axivc_process_available_cells(
+static int axivc_process_available_slots(
 	struct axivc_message_receiver *receiver, u8 *output, size_t output_len,
 	struct axivc_receive_progress *progress)
 {
 	size_t written = 0;
-	size_t consumed_cells = 0;
+	size_t consumed_slots = 0;
 
 	progress->written = 0;
-	progress->consumed_cells = 0;
+	progress->consumed_slots = 0;
 	progress->complete = false;
 
 	if (receiver->state == AXIVC_RX_FAILED)
@@ -256,39 +256,39 @@ static int axivc_process_available_cells(
 
 	for (;;)
 	{
-		u8 cell[AXIVC_CELL_SIZE];
+		u8 slot[AXIVC_SLOT_SIZE];
 		struct axivc_decoded_frame frame;
 		struct axivc_receive_transition transition;
 		int err;
 
-		if (!axivc_ring_try_peek_cell(receiver->ring, cell))
+		if (!axivc_ring_try_peek_slot(receiver->ring, slot))
 		{
 			progress->written = written;
-			progress->consumed_cells = consumed_cells;
+			progress->consumed_slots = consumed_slots;
 			return 0;
 		}
 
-		err = axivc_decode_frame(cell, &frame);
+		err = axivc_decode_frame(slot, &frame);
 		if (err)
 		{
-			/* Cells already consumed by this call stay consumed; the
+			/* Slots already consumed by this call stay consumed; the
 			 * error surfaces again on the next call. */
-			if (consumed_cells > 0)
+			if (consumed_slots > 0)
 			{
 				progress->written = written;
-				progress->consumed_cells = consumed_cells;
+				progress->consumed_slots = consumed_slots;
 				return 0;
 			}
 			return axivc_receiver_fail(receiver, err);
 		}
 
 		err = axivc_validate_transition(receiver, &frame, &transition);
-		if (err || (transition.aborted && consumed_cells > 0))
+		if (err || (transition.aborted && consumed_slots > 0))
 		{
-			if (consumed_cells > 0)
+			if (consumed_slots > 0)
 			{
 				progress->written = written;
-				progress->consumed_cells = consumed_cells;
+				progress->consumed_slots = consumed_slots;
 				return 0;
 			}
 			if (err)
@@ -300,18 +300,18 @@ static int axivc_process_available_cells(
 
 			if (frame.fragment_len > available)
 			{
-				if (consumed_cells == 0)
+				if (consumed_slots == 0)
 					return -EMSGSIZE;
 				progress->written = written;
-				progress->consumed_cells = consumed_cells;
+				progress->consumed_slots = consumed_slots;
 				return 0;
 			}
 			memcpy(output + written, frame.fragment, frame.fragment_len);
 			written += frame.fragment_len;
 		}
 
-		axivc_ring_pop_cell(receiver->ring);
-		consumed_cells += 1;
+		axivc_ring_pop_slot(receiver->ring);
+		consumed_slots += 1;
 		receiver->state = transition.next_state;
 		receiver->active = transition.active;
 		receiver->received = transition.received;
@@ -321,7 +321,7 @@ static int axivc_process_available_cells(
 		if (transition.complete)
 		{
 			progress->written = written;
-			progress->consumed_cells = consumed_cells;
+			progress->consumed_slots = consumed_slots;
 			progress->complete = true;
 			return 0;
 		}
@@ -453,7 +453,7 @@ static int axivc_validate_frame_shape(
 }
 
 int axivc_encode_frame(
-	u8 cell[AXIVC_CELL_SIZE], u64 message_id, u64 message_len, bool first,
+	u8 slot[AXIVC_SLOT_SIZE], u64 message_id, u64 message_len, bool first,
 	bool last, bool abort, const u8 *fragment, size_t fragment_len)
 {
 	u8 flags = 0;
@@ -473,23 +473,23 @@ int axivc_encode_frame(
 	if (abort)
 		flags |= AXIVC_FRAME_FLAG_ABORT;
 
-	memset(cell, 0, AXIVC_CELL_SIZE);
-	cell[VERSION_OFFSET] = AXIVC_MESSAGE_VERSION_V1;
-	cell[FLAGS_OFFSET] = flags;
-	axivc_write_le16(cell + HEADER_LEN_OFFSET, AXIVC_V1_HEADER_LEN);
-	axivc_write_le32(cell + FRAGMENT_LEN_OFFSET, fragment_len);
-	axivc_write_le64(cell + MESSAGE_ID_OFFSET, message_id);
-	axivc_write_le64(cell + MESSAGE_LEN_OFFSET, message_len);
+	memset(slot, 0, AXIVC_SLOT_SIZE);
+	slot[VERSION_OFFSET] = AXIVC_MESSAGE_VERSION_V1;
+	slot[FLAGS_OFFSET] = flags;
+	axivc_write_le16(slot + HEADER_LEN_OFFSET, AXIVC_V1_HEADER_LEN);
+	axivc_write_le32(slot + FRAGMENT_LEN_OFFSET, fragment_len);
+	axivc_write_le64(slot + MESSAGE_ID_OFFSET, message_id);
+	axivc_write_le64(slot + MESSAGE_LEN_OFFSET, message_len);
 	if (fragment_len > 0)
-		memcpy(cell + AXIVC_V1_HEADER_LEN, fragment, fragment_len);
+		memcpy(slot + AXIVC_V1_HEADER_LEN, fragment, fragment_len);
 	return 0;
 }
 
 int axivc_decode_frame(
-	const u8 cell[AXIVC_CELL_SIZE], struct axivc_decoded_frame *frame)
+	const u8 slot[AXIVC_SLOT_SIZE], struct axivc_decoded_frame *frame)
 {
-	u8 version = cell[VERSION_OFFSET];
-	u8 flags = cell[FLAGS_OFFSET];
+	u8 version = slot[VERSION_OFFSET];
+	u8 flags = slot[FLAGS_OFFSET];
 	u16 header_len;
 	u32 fragment_len;
 	u64 message_id;
@@ -501,15 +501,15 @@ int axivc_decode_frame(
 	if (flags & ~KNOWN_FLAGS)
 		return -EPROTO;
 
-	header_len = axivc_read_le16(cell + HEADER_LEN_OFFSET);
+	header_len = axivc_read_le16(slot + HEADER_LEN_OFFSET);
 	if (header_len != AXIVC_V1_HEADER_LEN)
 		return -EPROTO;
 
-	fragment_len = axivc_read_le32(cell + FRAGMENT_LEN_OFFSET);
-	if (fragment_len > AXIVC_CELL_SIZE - header_len)
+	fragment_len = axivc_read_le32(slot + FRAGMENT_LEN_OFFSET);
+	if (fragment_len > AXIVC_SLOT_SIZE - header_len)
 		return -EPROTO;
 
-	message_id = axivc_read_le64(cell + MESSAGE_ID_OFFSET);
+	message_id = axivc_read_le64(slot + MESSAGE_ID_OFFSET);
 	if (message_id == 0)
 		return -EPROTO;
 
@@ -517,14 +517,14 @@ int axivc_decode_frame(
 	last = flags & AXIVC_FRAME_FLAG_LAST;
 	abort = flags & AXIVC_FRAME_FLAG_ABORT;
 	err = axivc_validate_frame_shape(
-		axivc_read_le64(cell + MESSAGE_LEN_OFFSET), fragment_len, first, last,
+		axivc_read_le64(slot + MESSAGE_LEN_OFFSET), fragment_len, first, last,
 		abort);
 	if (err)
 		return err;
 
 	frame->message_id = message_id;
-	frame->message_len = axivc_read_le64(cell + MESSAGE_LEN_OFFSET);
-	frame->fragment = cell + header_len;
+	frame->message_len = axivc_read_le64(slot + MESSAGE_LEN_OFFSET);
+	frame->fragment = slot + header_len;
 	frame->fragment_len = fragment_len;
 	frame->first = first;
 	frame->last = last;

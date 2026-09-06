@@ -6,13 +6,18 @@
 
 #define AXIVC_REGION_MAGIC 0x49564332U
 #define AXIVC_REGION_VERSION 3U
-#define AXIVC_REGION_FEATURE_SPSC_OPAQUE_CELLS 1U
+#define AXIVC_REGION_FEATURE_SPSC_OPAQUE_SLOTS 1U
 
 /*
- * Full opaque-cell IVC region for one publisher/subscriber pair (region
+ * Full opaque-slot IVC region for one publisher/subscriber pair (region
  * version 3). The first two fields match axvm's host-side IVCChannelHeader:
  * the hypervisor initializes them when the host channel is created; the
  * remaining fields are owned by this shared-memory protocol.
+ *
+ * The rings sit at offsets 256 and 8704 and sizeof(struct axivc_region) is
+ * 17152. These layout parameters are part of the compatibility contract
+ * with the Rust `axivc` peer even though the region version stays 3: both
+ * ends must change them in lockstep.
  */
 struct axivc_region_header
 {

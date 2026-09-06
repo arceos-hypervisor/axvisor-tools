@@ -512,7 +512,7 @@ static ssize_t axivc_send_message(
 			goto abort;
 
 		sent += progress.consumed;
-		if (progress.published_cells)
+		if (progress.published_slots)
 		{
 			deadline = jiffies + msecs_to_jiffies(AXIVC_TRANSFER_TIMEOUT_MS);
 			axivc_notify_publisher(notify_publisher, publisher_id, key);
@@ -522,7 +522,7 @@ static ssize_t axivc_send_message(
 			mutex_unlock(&endpoint->tx_lock);
 			return count;
 		}
-		if (progress.published_cells)
+		if (progress.published_slots)
 			continue;
 		if (time_after_eq(jiffies, deadline))
 		{
@@ -578,14 +578,14 @@ static ssize_t axivc_recv_message(
 		err = axivc_message_try_read(rx, fragment, sizeof(fragment), &progress);
 		if (err)
 		{
-			/* A valid ABORT cell was consumed even though the message API
-			 * reports it as an error; notify the producer that ring space was
-			 * released. */
+			/* A slot carrying a valid ABORT frame was consumed even though
+			 * the message API reports it as an error; notify the producer that
+			 * ring space was released. */
 			if (err == -ECONNRESET)
 				axivc_notify_publisher(notify_publisher, publisher_id, key);
 			goto unlock;
 		}
-		if (progress.consumed_cells)
+		if (progress.consumed_slots)
 		{
 			deadline = jiffies + msecs_to_jiffies(AXIVC_TRANSFER_TIMEOUT_MS);
 			axivc_notify_publisher(notify_publisher, publisher_id, key);
@@ -606,7 +606,7 @@ static ssize_t axivc_recv_message(
 			err = meta.len == 0 ? -EOPNOTSUPP : received;
 			goto unlock;
 		}
-		if (progress.consumed_cells)
+		if (progress.consumed_slots)
 			continue;
 		if (time_after_eq(jiffies, deadline))
 		{

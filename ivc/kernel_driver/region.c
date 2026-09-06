@@ -8,12 +8,15 @@
 
 static void axivc_region_check_layout(void)
 {
+	/* Region layout is the shared-memory ABI with the Rust `axivc` peer:
+	 * these constants must match it exactly, even though the region
+	 * version stays 3. */
 	BUILD_BUG_ON(sizeof(struct axivc_region_header) != 32);
-	BUILD_BUG_ON(sizeof(struct axivc_ring) != 1088);
-	BUILD_BUG_ON(offsetof(struct axivc_region, publisher_to_subscriber) != 64);
+	BUILD_BUG_ON(sizeof(struct axivc_ring) != 8448);
+	BUILD_BUG_ON(offsetof(struct axivc_region, publisher_to_subscriber) != 256);
 	BUILD_BUG_ON(
-		offsetof(struct axivc_region, subscriber_to_publisher) != 1152);
-	BUILD_BUG_ON(sizeof(struct axivc_region) != 2240);
+		offsetof(struct axivc_region, subscriber_to_publisher) != 8704);
+	BUILD_BUG_ON(sizeof(struct axivc_region) != 17152);
 }
 
 int axivc_region_init_publisher(void *base, size_t shm_size, u64 channel_key)
@@ -54,7 +57,7 @@ int axivc_region_init_publisher(void *base, size_t shm_size, u64 channel_key)
 	 * that observes magic with acquire may immediately use the rings. */
 	WRITE_ONCE(header->header_size, sizeof(struct axivc_region_header));
 	WRITE_ONCE(header->region_size, sizeof(struct axivc_region));
-	WRITE_ONCE(header->features, AXIVC_REGION_FEATURE_SPSC_OPAQUE_CELLS);
+	WRITE_ONCE(header->features, AXIVC_REGION_FEATURE_SPSC_OPAQUE_SLOTS);
 	WRITE_ONCE(
 		header->publisher_to_subscriber_offset,
 		offsetof(struct axivc_region, publisher_to_subscriber));
@@ -82,8 +85,9 @@ int axivc_region_validate(
 	if (smp_load_acquire(&header->magic) != AXIVC_REGION_MAGIC)
 		return -EAGAIN;
 
-	/* v2 and v3 peers reject each other explicitly: the cell wire format
-	 * changed, so silent interoperation would corrupt messages. */
+	/* v2 peers fail the version check; v3 peers using different slot
+	 * parameters fail the strict layout checks below. Both cases reject
+	 * explicitly instead of silently corrupting messages. */
 	if (smp_load_acquire(&header->version) != AXIVC_REGION_VERSION)
 		return -EPROTO;
 	if (READ_ONCE(header->header_size) != sizeof(struct axivc_region_header))
@@ -91,8 +95,8 @@ int axivc_region_validate(
 	if (READ_ONCE(header->region_size) < sizeof(struct axivc_region))
 		return -EPROTO;
 	if ((READ_ONCE(header->features) &
-		 AXIVC_REGION_FEATURE_SPSC_OPAQUE_CELLS) !=
-		AXIVC_REGION_FEATURE_SPSC_OPAQUE_CELLS)
+		 AXIVC_REGION_FEATURE_SPSC_OPAQUE_SLOTS) !=
+		AXIVC_REGION_FEATURE_SPSC_OPAQUE_SLOTS)
 		return -EPROTO;
 	if (READ_ONCE(header->publisher_to_subscriber_offset) !=
 		offsetof(struct axivc_region, publisher_to_subscriber))
@@ -106,13 +110,13 @@ int axivc_region_validate(
 			AXIVC_RING_DIRECTION_PUBLISHER_TO_SUBSCRIBER ||
 		READ_ONCE(region->publisher_to_subscriber.capacity) !=
 			AXIVC_RING_CAPACITY ||
-		READ_ONCE(region->publisher_to_subscriber.cell_size) != AXIVC_CELL_SIZE)
+		READ_ONCE(region->publisher_to_subscriber.slot_size) != AXIVC_SLOT_SIZE)
 		return -EPROTO;
 	if (READ_ONCE(region->subscriber_to_publisher.direction) !=
 			AXIVC_RING_DIRECTION_SUBSCRIBER_TO_PUBLISHER ||
 		READ_ONCE(region->subscriber_to_publisher.capacity) !=
 			AXIVC_RING_CAPACITY ||
-		READ_ONCE(region->subscriber_to_publisher.cell_size) != AXIVC_CELL_SIZE)
+		READ_ONCE(region->subscriber_to_publisher.slot_size) != AXIVC_SLOT_SIZE)
 		return -EPROTO;
 	return 0;
 }
