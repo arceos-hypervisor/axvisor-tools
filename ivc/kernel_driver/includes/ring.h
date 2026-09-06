@@ -1,58 +1,57 @@
 #pragma once
 
+#include <linux/compiler.h>
 #include <linux/types.h>
-#include <linux/uaccess.h>
 
-#define AXIVC_REGION_MAGIC 0x49564332U
-#define AXIVC_REGION_VERSION 2U
-#define AXIVC_REGION_FEATURE_SPSC_FIXED_SLOTS 1U
-#define AXIVC_SLOT_PAYLOAD_SIZE 48U
+/* Opaque-cell SPSC ring shared with the Rust `axivc` crate. */
+#define AXIVC_CELL_SIZE 64U
 #define AXIVC_RING_CAPACITY 16U
-#define AXIVC_MESSAGE_KIND_REQUEST 1U
-#define AXIVC_MESSAGE_KIND_ACK 2U
 
-struct axivc_region_header {
-	u32 magic;
-	u32 version;
-	u32 header_size;
-	u32 region_size;
-	u32 features;
-	u32 publisher_to_subscriber_offset;
-	u32 subscriber_to_publisher_offset;
-	u32 ring_size;
-} __aligned(8);
+#define AXIVC_RING_DIRECTION_PUBLISHER_TO_SUBSCRIBER 1U
+#define AXIVC_RING_DIRECTION_SUBSCRIBER_TO_PUBLISHER 2U
 
-struct axivc_message_slot {
-	u64 sequence;
-	u32 len;
-	u32 kind;
-	u8 payload[AXIVC_SLOT_PAYLOAD_SIZE];
-} __aligned(64);
-
-struct axivc_ring {
+/*
+ * Single-producer, single-consumer opaque-cell ring.
+ *
+ * The ring never interprets cell contents; only head/tail carry
+ * synchronization. Producer and consumer synchronize through acquire/release
+ * on head/tail exactly like the Rust peer:
+ *
+ * - producer reads head with acquire, writes the full cell, then publishes
+ *   tail with release;
+ * - consumer reads tail with acquire, copies the cell out, then releases
+ *   head.
+ *
+ * cells must start at offset 64 inside the ring so every cell stays
+ * 64-byte aligned; sizeof(struct axivc_ring) is 1088.
+ */
+struct axivc_ring
+{
 	u32 direction;
 	u32 capacity;
-	u32 slot_payload_size;
+	u32 cell_size;
 	u32 head;
 	u32 tail;
 	u32 reserved[3];
-	struct axivc_message_slot slots[AXIVC_RING_CAPACITY];
+	u8 cells[AXIVC_RING_CAPACITY][AXIVC_CELL_SIZE] __aligned(64);
 } __aligned(64);
 
-struct axivc_region {
-	u64 publisher_id;
-	u64 key;
-	struct axivc_region_header header;
-	struct axivc_ring publisher_to_subscriber;
-	struct axivc_ring subscriber_to_publisher;
-} __aligned(64);
+/* Resets the ring to an empty v3 queue. Called before the region is
+ * published to the peer, so plain stores are sufficient except for the
+ * final tail release. */
+void axivc_ring_initialize(struct axivc_ring *ring, u32 direction);
 
-void shm_ring_init(
-	void *shm_base, size_t shm_region_size, uint64_t channel_key);
-size_t shm_ring_enqueue(void *base, const char __user *data, size_t len);
-int shm_ring_dequeue(
-	void *base, char __user *buf, size_t count, size_t *out_len);
-int axivc_region_validate(
-	void *base, size_t shm_region_size, u64 publisher_id, u64 channel_key);
-ssize_t axivc_region_recv_request_and_ack(
-	void *base, char __user *buf, size_t count, u64 *sequence);
+/* Returns false when the ring has no free cell; the cell is never
+ * overwritten in that case. */
+bool axivc_ring_try_push_cell(
+	struct axivc_ring *ring, const u8 cell[AXIVC_CELL_SIZE]);
+
+/* Copies the oldest published cell without consuming it. Returns false when
+ * the ring is empty. The consumer must call axivc_ring_pop_cell() only after
+ * the peeked cell has been fully validated and copied. */
+bool axivc_ring_try_peek_cell(
+	struct axivc_ring *ring, u8 cell[AXIVC_CELL_SIZE]);
+
+/* Consumes one previously peeked cell. Must only be called after a
+ * successful axivc_ring_try_peek_cell(). */
+void axivc_ring_pop_cell(struct axivc_ring *ring);
