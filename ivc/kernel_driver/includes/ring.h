@@ -1,58 +1,62 @@
 #pragma once
 
+#include <linux/compiler.h>
 #include <linux/types.h>
-#include <linux/uaccess.h>
 
-#define AXIVC_REGION_MAGIC 0x49564332U
-#define AXIVC_REGION_VERSION 2U
-#define AXIVC_REGION_FEATURE_SPSC_FIXED_SLOTS 1U
-#define AXIVC_SLOT_PAYLOAD_SIZE 48U
-#define AXIVC_RING_CAPACITY 16U
-#define AXIVC_MESSAGE_KIND_REQUEST 1U
-#define AXIVC_MESSAGE_KIND_ACK 2U
+/* Opaque-slot SPSC ring shared with the Rust `axivc` crate. */
+#define AXIVC_SLOT_SIZE 256U
+#define AXIVC_RING_CAPACITY 32U
 
-struct axivc_region_header {
-	u32 magic;
-	u32 version;
-	u32 header_size;
-	u32 region_size;
-	u32 features;
-	u32 publisher_to_subscriber_offset;
-	u32 subscriber_to_publisher_offset;
-	u32 ring_size;
-} __aligned(8);
+#define AXIVC_RING_DIRECTION_PUBLISHER_TO_SUBSCRIBER 1U
+#define AXIVC_RING_DIRECTION_SUBSCRIBER_TO_PUBLISHER 2U
 
-struct axivc_message_slot {
-	u64 sequence;
-	u32 len;
-	u32 kind;
-	u8 payload[AXIVC_SLOT_PAYLOAD_SIZE];
-} __aligned(64);
-
-struct axivc_ring {
+/*
+ * Single-producer, single-consumer opaque-slot ring.
+ *
+ * The ring never interprets slot contents; only head/tail carry
+ * synchronization. Producer and consumer synchronize through acquire/release
+ * on head/tail exactly like the Rust peer:
+ *
+ * - producer reads head with acquire, writes the full slot, then publishes
+ *   tail with release;
+ * - consumer reads tail with acquire, copies the slot out, then releases
+ *   head.
+ *
+ * slots start at offset AXIVC_SLOT_SIZE inside the ring so every slot stays
+ * 256-byte aligned; with a page-aligned region base, a 4 KiB page fits
+ * exactly 16 slots and no slot crosses a page boundary.
+ * sizeof(struct axivc_ring) is 8448.
+ *
+ * The layout parameters (slot size, capacity, ring size and ring offsets)
+ * are part of the compatibility contract with the Rust peer: both ends must
+ * change them in lockstep, even when AXIVC_REGION_VERSION stays the same.
+ */
+struct axivc_ring
+{
 	u32 direction;
 	u32 capacity;
-	u32 slot_payload_size;
+	u32 slot_size;
 	u32 head;
 	u32 tail;
 	u32 reserved[3];
-	struct axivc_message_slot slots[AXIVC_RING_CAPACITY];
-} __aligned(64);
+	u8 slots[AXIVC_RING_CAPACITY][AXIVC_SLOT_SIZE] __aligned(AXIVC_SLOT_SIZE);
+} __aligned(AXIVC_SLOT_SIZE);
 
-struct axivc_region {
-	u64 publisher_id;
-	u64 key;
-	struct axivc_region_header header;
-	struct axivc_ring publisher_to_subscriber;
-	struct axivc_ring subscriber_to_publisher;
-} __aligned(64);
+/* Resets the ring to an empty v3 queue. Called before the region is
+ * published to the peer, so plain stores are sufficient except for the
+ * final tail release. */
+void axivc_ring_initialize(struct axivc_ring *ring, u32 direction);
 
-void shm_ring_init(
-	void *shm_base, size_t shm_region_size, uint64_t channel_key);
-size_t shm_ring_enqueue(void *base, const char __user *data, size_t len);
-int shm_ring_dequeue(
-	void *base, char __user *buf, size_t count, size_t *out_len);
-int axivc_region_validate(
-	void *base, size_t shm_region_size, u64 publisher_id, u64 channel_key);
-ssize_t axivc_region_recv_request_and_ack(
-	void *base, char __user *buf, size_t count, u64 *sequence);
+/* Returns false when the ring has no free slot; the slot is never
+ * overwritten in that case. */
+bool axivc_ring_try_push_slot(
+	struct axivc_ring *ring, const u8 slot[AXIVC_SLOT_SIZE]);
+
+/* Copies the oldest published slot without consuming it. Returns false when
+ * the ring is empty. The consumer must call axivc_ring_pop_slot() only after
+ * the peeked slot has been fully validated and copied. */
+bool axivc_ring_try_peek_slot(struct axivc_ring *ring, u8 slot[AXIVC_SLOT_SIZE]);
+
+/* Consumes one previously peeked slot. Must only be called after a
+ * successful axivc_ring_try_peek_slot(). */
+void axivc_ring_pop_slot(struct axivc_ring *ring);

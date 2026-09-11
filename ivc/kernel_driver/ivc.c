@@ -1,11 +1,8 @@
-#include <asm/cacheflush.h>
-#include <asm/memory.h>
-#include <asm/tlbflush.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/io.h>
+#include <linux/jiffies.h>
 #include <linux/list.h>
-#include <linux/memory.h>
 #include <linux/miscdevice.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -13,12 +10,28 @@
 
 #include "includes/hvc.h"
 #include "includes/ivc.h"
-#include "includes/ring.h"
+#include "includes/message.h"
+#include "includes/region.h"
 #include "includes/utils.h"
 
+#define AXIVC_TRANSFER_TIMEOUT_MS 30000
+#define AXIVC_SUBSCRIBE_WAIT_MS 10000
+#define AXIVC_POLL_INTERVAL_MS 10
 
-#define AXIVC_REGION_READY_RETRIES 100
-#define AXIVC_REGION_READY_DELAY_MS 10
+struct axivc_endpoint
+{
+	struct axivc_message_sender tx;
+	struct axivc_message_receiver rx;
+	struct mutex tx_lock;
+	struct mutex rx_lock;
+	int tx_error;
+};
+
+struct axivc_hvc_output
+{
+	u64 shm_base;
+	u64 shm_size;
+};
 
 struct axivc_publisher_vdev
 {
@@ -26,11 +39,12 @@ struct axivc_publisher_vdev
 	char name[64];
 	int id;
 	bool active;
-	uint64_t key;
-	uint64_t shm_base;
-	uint64_t shm_size;
-	void __iomem *mapped_shm_base;
-
+	bool removing;
+	u64 key;
+	u64 shm_base;
+	u64 shm_size;
+	void *mapped_shm_base;
+	struct axivc_endpoint endpoint;
 	struct list_head list;
 };
 
@@ -40,169 +54,77 @@ struct axivc_subscriber_vdev
 	char name[64];
 	int id;
 	bool active;
-	uint64_t publisher_id;
-	uint64_t key;
-	uint64_t shm_base;
-	uint64_t shm_size;
-	void __iomem *mapped_shm_base;
-
+	bool removing;
+	u64 publisher_id;
+	u64 key;
+	u64 shm_base;
+	u64 shm_size;
+	void *mapped_shm_base;
+	struct axivc_endpoint endpoint;
 	struct list_head list;
 };
 
-static int pub_vdev_count = 0;
+static int pub_vdev_count;
 static DEFINE_MUTEX(pub_vdev_lock);
-
 static LIST_HEAD(pub_vdev_list_head);
-static int next_pub_vdev_id = 0;
+static int next_pub_vdev_id;
 
-static int sub_vdev_count = 0;
+static int sub_vdev_count;
 static DEFINE_MUTEX(sub_vdev_lock);
 static LIST_HEAD(sub_vdev_list_head);
-static int next_sub_vdev_id = 0;
+static int next_sub_vdev_id;
 
-struct axivc_hvc_output
-{
-	u64 shm_base;
-	u64 shm_size;
-};
-
-static int ivc_wait_for_region_ready(
-	void __iomem *mapped_shm_base, uint64_t shm_size, uint64_t publisher_id,
-	uint64_t key)
-{
-	int attempt;
-	int ret;
-
-	for (attempt = 0; attempt < AXIVC_REGION_READY_RETRIES; attempt++)
-	{
-		ret = axivc_region_validate(
-			mapped_shm_base, shm_size, publisher_id, key);
-		if (ret != -EAGAIN)
-			return ret;
-		msleep(AXIVC_REGION_READY_DELAY_MS);
-	}
-
-	return -EAGAIN;
-}
-
-/**
- * @brief Read operation for the axvisor IVC publisher device.
- *
- * Read data from IVC publisher device is not valid,
- * as a publisher, you can only write data to the device.
- */
-static ssize_t axivc_publisher_read(
-	struct file *file, char __user *buf, size_t count, loff_t *ppos);
-
-/**
- * @brief Write operation for the axvisor IVC publisher device.
- *
- * This function is called when the user writes to the IVC publisher device.
- * It copies data from the user buffer to the IVC shared memory region.
- *
- * @param file Pointer to the file structure.
- * @param buf User-space buffer containing data to write.
- * @param count Number of bytes to write.
- * @param ppos Pointer to the file position.
- * @return Number of bytes written on success, or a negative error code on
- * failure.
- */
-static ssize_t axivc_publisher_write(
-	struct file *file, const char __user *buf, size_t count, loff_t *ppos);
-
-/**
- * @brief Open operation for the axvisor IVC publisher device.
- *
- * The IVC channel is already established during module initialization,
- * so this function will just check if the shared memory base and size are
- * initialized. If they are not, it will return an error.
- */
-static int axivc_publisher_open(struct inode *inode, struct file *file);
-
-/**
- * @brief Release operation for the axvisor IVC publisher device.
- *
- * It will NOT close the IVC channel by calling `ivc_unpublish_channel()`,
- * as the channel is expected to remain open until the module is unloaded.
- * Instead, it will just log the closure of the device.
- */
-static int axivc_publisher_release(struct inode *inode, struct file *file);
-
-int ivc_unregister_publisher_vdev(struct axivc_publisher_vdev *vdev);
-int ivc_unregister_subscriber_vdev(struct axivc_subscriber_vdev *vdev);
-
-/**
- * @brief Read operation for the axvisor IVC subscriber device.
- *
- * This function is called when the user reads from the IVC subscriber device.
- * It reads data from the IVC shared memory region and copies it to the user
- * buffer.
- */
-static ssize_t axivc_subscriber_read(
-	struct file *file, char __user *buf, size_t count, loff_t *ppos);
-
-/**
- * @brief Open operation for the axvisor IVC subscriber device.
- *
- * This function is expected to be called by the user client when it wants to
- * subscribe to a IVC channel, the channel will not be established immediately,
- * the user client is expected to configure the target publisher ID and
- * channel key through `ioctl`.
- */
-static int axivc_subscriber_open(struct inode *inode, struct file *file);
-
-/**
- * @brief Release operation for the axvisor IVC subscriber device.
- *
- * It will close the IVC channel by calling `ivc_unsubscribe_channel()`.
- * This function is expected to be called by the user client when it no longer
- * needs to subscribe to the IVC channel.
- * It will also log the closure of the device.
- */
-static int axivc_subscriber_release(struct inode *inode, struct file *file);
-
-/**
- * @brief IOCTL operation for the axvisor IVC subscriber device.
- *
- * This function handles the IOCTL commands for the IVC subscriber device,
- * allowing the user client to subscribe or unsubscribe from a channel, and
- * set the target publisher ID.
- *
- * @param file Pointer to the file structure.
- * @param cmd The command to execute.
- * @param arg The argument for the command.
- * @return 0 on success, or a negative error code on failure.
- */
-static long
-axivc_manager_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
-
-/**
- * @brief File operations structure for the axvisor IVC publisher device.
- */
 static const struct file_operations axivc_publisher_fops;
-
-/**
- * @brief File operations structure for the axvisor IVC subscriber device.
- */
 static const struct file_operations axivc_subscriber_fops;
 
-int ivc_publish_channel(
-	uint64_t channel_key, uint64_t expected_shm_size, char *pub_dev_name)
-{
-	int ret;
-	int id;
-	uint64_t shm_base = 0;
-	uint64_t shm_size = expected_shm_size;
-	uint64_t shm_base_ptr;
-	uint64_t shm_size_ptr;
-	struct axivc_publisher_vdev *vdev;
-	void __iomem *mapped_shm_base;
-	struct axivc_hvc_output *hvc_output;
+static ssize_t axivc_send_message(
+	struct axivc_endpoint *endpoint, bool notify_publisher, u64 publisher_id,
+	u64 key, const char __user *buf, size_t count);
+static ssize_t axivc_recv_message(
+	struct axivc_endpoint *endpoint, bool notify_publisher, u64 publisher_id,
+	u64 key, char __user *buf, size_t count);
+static void axivc_abort_send(
+	struct axivc_endpoint *endpoint, bool notify_publisher, u64 publisher_id,
+	u64 key);
 
-	INFO(
-		"axvisor: Initializing IVC channel with key: 0x%llx, expected size "
-		"0x%llx\n",
-		channel_key, expected_shm_size);
+static void axivc_endpoint_init(
+	struct axivc_endpoint *endpoint, struct axivc_ring *tx_ring,
+	struct axivc_ring *rx_ring)
+{
+	axivc_message_sender_init(&endpoint->tx, tx_ring);
+	axivc_message_receiver_init(&endpoint->rx, rx_ring);
+	mutex_init(&endpoint->tx_lock);
+	mutex_init(&endpoint->rx_lock);
+	endpoint->tx_error = 0;
+}
+
+static void axivc_rollback_publish(u64 key)
+{
+	if (hvc_unpublish_channel(key))
+		WARNING("axvisor: Failed to roll back channel 0x%llx\n", key);
+}
+
+static void axivc_rollback_subscribe(u64 publisher_id, u64 key)
+{
+	if (hvc_unsubscribe_channel(publisher_id, key))
+		WARNING(
+			"axvisor: Failed to roll back subscription %llu/0x%llx\n",
+			publisher_id, key);
+}
+
+static int
+ivc_publish_channel(u64 channel_key, u64 expected_shm_size, char *pub_dev_name)
+{
+	u64 shm_base_ptr;
+	u64 shm_size_ptr;
+	struct axivc_publisher_vdev *vdev;
+	struct axivc_hvc_output *hvc_output;
+	struct axivc_region *region;
+	void *mapped_shm_base;
+	u64 shm_base;
+	u64 shm_size;
+	int id;
+	int err;
 
 	hvc_output = kzalloc(sizeof(*hvc_output), GFP_KERNEL);
 	if (!hvc_output)
@@ -212,16 +134,13 @@ int ivc_publish_channel(
 	shm_size_ptr = kva2pa((u64)&hvc_output->shm_size);
 	if (shm_base_ptr == ~0ULL || shm_size_ptr == ~0ULL)
 	{
-		ERROR("axvisor: Failed to translate IVC publish output buffer\n");
 		kfree(hvc_output);
 		return -EFAULT;
 	}
 
-	// Call the hypervisor to publish the channel
-	ret = hvc_publish_channel((u64)channel_key, shm_base_ptr, shm_size_ptr);
-	if (ret != 0)
+	err = hvc_publish_channel(channel_key, shm_base_ptr, shm_size_ptr);
+	if (err)
 	{
-		ERROR("axvisor: Failed to publish channel, error code: %d\n", ret);
 		kfree(hvc_output);
 		return -EIO;
 	}
@@ -229,48 +148,42 @@ int ivc_publish_channel(
 	shm_size = hvc_output->shm_size;
 	kfree(hvc_output);
 
-	INFO(
-		"axvisor: IVC publish channel allocated successfully, base: 0x%llx, "
-		"size: 0x%llx key 0x%llx\n",
-		shm_base, shm_size, channel_key);
-
-	// Map the shared memory base to kernel space.
-	// This assumes that the shared memory is already allocated and accessible.
-	// The shared memory base should be a physical address.
-	mapped_shm_base = ioremap(shm_base, shm_size);
+	/* The IVC rings are cache-coherent shared RAM, not MMIO. Message V1
+	 * synchronization uses normal-memory acquire/release operations, so map
+	 * the guest physical range with WB semantics rather than ioremap's
+	 * device-memory semantics. */
+	mapped_shm_base = memremap(shm_base, shm_size, MEMREMAP_WB);
 	if (!mapped_shm_base)
 	{
-		ERROR("axvisor: Failed to map shared memory base\n");
-		hvc_unpublish_channel(channel_key);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto rollback_channel;
 	}
 
-	mutex_lock(&pub_vdev_lock);
-
-	if (pub_vdev_count >= MAX_VDEVS)
-	{
-		iounmap(mapped_shm_base);
-		mutex_unlock(&pub_vdev_lock);
-		return -ENOMEM;
-	}
-
-	// id = pub_vdev_count;
-	id = next_pub_vdev_id++;
+	err = axivc_region_init_publisher(mapped_shm_base, shm_size, channel_key);
+	if (err)
+		goto unmap_region;
 
 	vdev = kzalloc(sizeof(*vdev), GFP_KERNEL);
 	if (!vdev)
 	{
-		iounmap(mapped_shm_base);
-		mutex_unlock(&pub_vdev_lock);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto unmap_region;
 	}
+
+	mutex_lock(&pub_vdev_lock);
+	if (pub_vdev_count >= MAX_VDEVS)
+	{
+		mutex_unlock(&pub_vdev_lock);
+		kfree(vdev);
+		err = -ENOSPC;
+		goto unmap_region;
+	}
+	id = next_pub_vdev_id++;
+	pub_vdev_count++;
+	mutex_unlock(&pub_vdev_lock);
 	snprintf(
 		vdev->name, sizeof(vdev->name), "%s%d", IVC_PUBLISHER_DEV_NAME_PREFIX,
 		id);
-	snprintf(
-		pub_dev_name, sizeof(vdev->name), "/dev/%s%d",
-		IVC_PUBLISHER_DEV_NAME_PREFIX, id);
-
 	vdev->misc.minor = MISC_DYNAMIC_MINOR;
 	vdev->misc.name = vdev->name;
 	vdev->misc.fops = &axivc_publisher_fops;
@@ -279,127 +192,89 @@ int ivc_publish_channel(
 	vdev->shm_base = shm_base;
 	vdev->shm_size = shm_size;
 	vdev->mapped_shm_base = mapped_shm_base;
-	vdev->active = false;
 
-	// Init ring buffer in shared memory region from publisher side.
-	shm_ring_init(mapped_shm_base, shm_size, channel_key);
+	region = (struct axivc_region *)mapped_shm_base;
+	axivc_endpoint_init(
+		&vdev->endpoint, &region->publisher_to_subscriber,
+		&region->subscriber_to_publisher);
 
-	ret = misc_register(&vdev->misc);
-	if (ret)
+	err = misc_register(&vdev->misc);
+	if (err)
 	{
-		kfree(vdev);
-		iounmap(mapped_shm_base);
+		mutex_lock(&pub_vdev_lock);
+		pub_vdev_count--;
 		mutex_unlock(&pub_vdev_lock);
-		return ret;
-	}
-
-	INIT_LIST_HEAD(&vdev->list);
-	list_add_tail(&vdev->list, &pub_vdev_list_head);
-
-	pub_vdev_count++;
-
-	mutex_unlock(&pub_vdev_lock);
-
-	INFO(
-		"manage: created vdev %s (id=%d) {ket = %llx}\n", vdev->name, vdev->id,
-		vdev->key);
-
-	return 0;
-}
-
-int ivc_unpublish_channel(uint64_t channel_key)
-{
-	int ret;
-	bool found = false;
-	struct axivc_publisher_vdev *vdev, *tmp;
-
-	INFO("axvisor: Unregistering IVC channel with key: 0x%llx\n", channel_key);
-
-	// Call the hypervisor to unregister the channel
-	ret = hvc_unpublish_channel(channel_key);
-	if (ret != 0)
-	{
-		ERROR("axvisor: Failed to unregister channel, error code: %d\n", ret);
-		return -EIO;
-	}
-
-	// Unregister the publisher device
-	list_for_each_entry_safe(vdev, tmp, &pub_vdev_list_head, list)
-	{
-		if (vdev->key == channel_key)
-		{
-			found = true;
-			// Unmap the shared memory base from kernel space.
-			iounmap(vdev->mapped_shm_base);
-			// Unregister the publisher device
-			ret = ivc_unregister_publisher_vdev(vdev);
-			if (ret < 0)
-			{
-				ERROR(
-					"axvisor: Failed to unregister publisher device %s, "
-					"error code: %d\n",
-					vdev->name, ret);
-				return ret;
-			}
-
-			break;
-		}
-	}
-	if (!found)
-	{
-		ERROR(
-			"axvisor: No publisher device found with key: 0x%llx\n",
-			channel_key);
-		return -ENOENT;
-	}
-
-	INFO("axvisor: IVC channel unregistered successfully\n");
-	return 0;
-}
-
-int ivc_unregister_publisher_vdev(struct axivc_publisher_vdev *vdev)
-{
-	if (!vdev)
-		return -EINVAL;
-
-	INFO(
-		"axvisor: Unregistering publisher device %s (id=%d) key %llx\n",
-		vdev->name, vdev->id, vdev->key);
-
-	if (vdev->active)
-	{
-		ERROR(
-			"axvisor: Cannot unregister active publisher device %s (id=%d), "
-			"please close it first\n",
-			vdev->name, vdev->id);
-		return -EBUSY;
+		kfree(vdev);
+		goto unmap_region;
 	}
 
 	mutex_lock(&pub_vdev_lock);
-
-	misc_deregister(&vdev->misc);
-	list_del(&vdev->list);
-	kfree(vdev);
-
-	pub_vdev_count--;
+	list_add_tail(&vdev->list, &pub_vdev_list_head);
 	mutex_unlock(&pub_vdev_lock);
 
+	snprintf(pub_dev_name, MAX_IVC_DEV_NAME_LENGTH, "/dev/%s", vdev->name);
 	return 0;
+
+unmap_region:
+	memunmap(mapped_shm_base);
+rollback_channel:
+	axivc_rollback_publish(channel_key);
+	return err;
 }
 
-int ivc_subscribe_channel(u64 publisher_id, u64 key, char *sub_dev_name)
+static int ivc_unpublish_channel(u64 channel_key)
 {
-	int ret;
-	int id;
-	uint64_t shm_base = 0;
-	uint64_t shm_size = 0;
-	uint64_t shm_base_ptr;
-	uint64_t shm_size_ptr;
-	struct axivc_subscriber_vdev *vdev;
-	void __iomem *mapped_shm_base;
-	struct axivc_hvc_output *hvc_output;
+	struct axivc_publisher_vdev *vdev;
+	int err;
 
-	INFO("axvisor: Subscribing to IVC channel with key: 0x%llx\n", key);
+	mutex_lock(&pub_vdev_lock);
+	list_for_each_entry(vdev, &pub_vdev_list_head, list)
+	{
+		if (vdev->key != channel_key)
+			continue;
+		if (vdev->active || vdev->removing)
+		{
+			mutex_unlock(&pub_vdev_lock);
+			return -EBUSY;
+		}
+		vdev->removing = true;
+		mutex_unlock(&pub_vdev_lock);
+
+		err = hvc_unpublish_channel(channel_key);
+		if (err)
+		{
+			mutex_lock(&pub_vdev_lock);
+			vdev->removing = false;
+			mutex_unlock(&pub_vdev_lock);
+			return -EIO;
+		}
+
+		misc_deregister(&vdev->misc);
+		mutex_lock(&pub_vdev_lock);
+		list_del(&vdev->list);
+		pub_vdev_count--;
+		mutex_unlock(&pub_vdev_lock);
+		memunmap(vdev->mapped_shm_base);
+		kfree(vdev);
+		return 0;
+	}
+	mutex_unlock(&pub_vdev_lock);
+	return -ENOENT;
+}
+
+static int ivc_subscribe_channel(u64 publisher_id, u64 key, char *sub_dev_name)
+{
+	u64 shm_base_ptr;
+	u64 shm_size_ptr;
+	struct axivc_subscriber_vdev *vdev;
+	struct axivc_hvc_output *hvc_output;
+	struct axivc_region *region;
+	void *mapped_shm_base;
+	unsigned long deadline;
+	u64 shm_base;
+	u64 shm_size;
+	int id;
+	int err;
 
 	hvc_output = kzalloc(sizeof(*hvc_output), GFP_KERNEL);
 	if (!hvc_output)
@@ -408,16 +283,13 @@ int ivc_subscribe_channel(u64 publisher_id, u64 key, char *sub_dev_name)
 	shm_size_ptr = kva2pa((u64)&hvc_output->shm_size);
 	if (shm_base_ptr == ~0ULL || shm_size_ptr == ~0ULL)
 	{
-		ERROR("axvisor: Failed to translate IVC subscribe output buffer\n");
 		kfree(hvc_output);
 		return -EFAULT;
 	}
 
-	// Call the hypervisor to subscribe to the channel
-	ret = hvc_subscribe_channel(publisher_id, key, shm_base_ptr, shm_size_ptr);
-	if (ret != 0)
+	err = hvc_subscribe_channel(publisher_id, key, shm_base_ptr, shm_size_ptr);
+	if (err)
 	{
-		ERROR("axvisor: Failed to subscribe to channel, error code: %d\n", ret);
 		kfree(hvc_output);
 		return -EIO;
 	}
@@ -425,58 +297,52 @@ int ivc_subscribe_channel(u64 publisher_id, u64 key, char *sub_dev_name)
 	shm_size = hvc_output->shm_size;
 	kfree(hvc_output);
 
-	INFO(
-		"axvisor: IVC subscribtion channel init successfully, base: 0x%llx, "
-		"size: 0x%llx\n",
-		shm_base, shm_size);
-
-	// Map the shared memory base to kernel space.
-	// This assumes that the shared memory is already allocated and accessible.
-	// The shared memory base should be a physical address.
-	mapped_shm_base = ioremap(shm_base, shm_size);
+	/* This region participates in the same normal-memory atomic protocol as
+	 * the Rust peer; it must not be accessed through an MMIO mapping. */
+	mapped_shm_base = memremap(shm_base, shm_size, MEMREMAP_WB);
 	if (!mapped_shm_base)
 	{
-		ERROR("axvisor: Failed to map shared memory base\n");
-		hvc_unsubscribe_channel(publisher_id, key);
-		return -ENOMEM;
-	}
-	ret = ivc_wait_for_region_ready(
-		mapped_shm_base, shm_size, publisher_id, key);
-	if (ret)
-	{
-		ERROR(
-			"axvisor: Shared IVC region is not axivc v2 compatible, error "
-			"code: %d\n",
-			ret);
-		iounmap(mapped_shm_base);
-		hvc_unsubscribe_channel(publisher_id, key);
-		return ret;
-	}
-	mutex_lock(&sub_vdev_lock);
-
-	if (sub_vdev_count >= MAX_VDEVS)
-	{
-		iounmap(mapped_shm_base);
-		mutex_unlock(&sub_vdev_lock);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto rollback_subscription;
 	}
 
-	id = next_sub_vdev_id++;
+	deadline = jiffies + msecs_to_jiffies(AXIVC_SUBSCRIBE_WAIT_MS);
+	for (;;)
+	{
+		err =
+			axivc_region_validate(mapped_shm_base, shm_size, publisher_id, key);
+		if (err != -EAGAIN || time_after_eq(jiffies, deadline))
+			break;
+		if (msleep_interruptible(AXIVC_POLL_INTERVAL_MS))
+		{
+			err = -ERESTARTSYS;
+			break;
+		}
+	}
+	if (err)
+		goto unmap_subscription;
+
 	vdev = kzalloc(sizeof(*vdev), GFP_KERNEL);
 	if (!vdev)
 	{
-		iounmap(mapped_shm_base);
-		mutex_unlock(&sub_vdev_lock);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto unmap_subscription;
 	}
 
+	mutex_lock(&sub_vdev_lock);
+	if (sub_vdev_count >= MAX_VDEVS)
+	{
+		mutex_unlock(&sub_vdev_lock);
+		kfree(vdev);
+		err = -ENOSPC;
+		goto unmap_subscription;
+	}
+	id = next_sub_vdev_id++;
+	sub_vdev_count++;
+	mutex_unlock(&sub_vdev_lock);
 	snprintf(
 		vdev->name, sizeof(vdev->name), "%s%d", IVC_SUBSCRIBER_DEV_NAME_PREFIX,
 		id);
-	snprintf(
-		sub_dev_name, sizeof(vdev->name), "/dev/%s%d",
-		IVC_SUBSCRIBER_DEV_NAME_PREFIX, id);
-
 	vdev->misc.minor = MISC_DYNAMIC_MINOR;
 	vdev->misc.name = vdev->name;
 	vdev->misc.fops = &axivc_subscriber_fops;
@@ -486,271 +352,327 @@ int ivc_subscribe_channel(u64 publisher_id, u64 key, char *sub_dev_name)
 	vdev->shm_base = shm_base;
 	vdev->shm_size = shm_size;
 	vdev->mapped_shm_base = mapped_shm_base;
-	vdev->active = false;
 
-	ret = misc_register(&vdev->misc);
-	if (ret)
+	region = (struct axivc_region *)mapped_shm_base;
+	axivc_endpoint_init(
+		&vdev->endpoint, &region->subscriber_to_publisher,
+		&region->publisher_to_subscriber);
+
+	err = misc_register(&vdev->misc);
+	if (err)
 	{
-		kfree(vdev);
-		iounmap(mapped_shm_base);
+		mutex_lock(&sub_vdev_lock);
+		sub_vdev_count--;
 		mutex_unlock(&sub_vdev_lock);
-		return ret;
-	}
-
-	INIT_LIST_HEAD(&vdev->list);
-	list_add_tail(&vdev->list, &sub_vdev_list_head);
-	sub_vdev_count++;
-	mutex_unlock(&sub_vdev_lock);
-
-	INFO(
-		"manage: created subscriber vdev %s (id=%d) {publisher_id = %llu, key "
-		"= "
-		"0x%llx}\n",
-		vdev->name, vdev->id, vdev->publisher_id, vdev->key);
-
-	return 0;
-}
-
-int ivc_unsubscribe_channel(u64 publisher_id, u64 key)
-{
-	int ret;
-	bool found = false;
-	struct axivc_subscriber_vdev *vdev, *tmp;
-
-	INFO(
-		"axvisor: Unsubscribing from IVC channel %llu with key: 0x%llx\n",
-		publisher_id, key);
-
-	// Call the hypervisor to unsubscribe from the channel
-	ret = hvc_unsubscribe_channel(publisher_id, key);
-	if (ret != 0)
-	{
-		ERROR(
-			"axvisor: Failed to unsubscribe from channel %llu, error code: "
-			"%d\n",
-			publisher_id, ret);
-		return -EIO;
-	}
-
-	// Unregister the subscriber device
-	list_for_each_entry_safe(vdev, tmp, &sub_vdev_list_head, list)
-	{
-		if (vdev->publisher_id == publisher_id && vdev->key == key)
-		{
-			found = true;
-			// Unmap the shared memory base from kernel space.
-			iounmap(vdev->mapped_shm_base);
-			// Unregister the subscriber device
-			ret = ivc_unregister_subscriber_vdev(vdev);
-			if (ret < 0)
-			{
-				ERROR(
-					"axvisor: Failed to unregister subscriber device %s, "
-					"error code: %d\n",
-					vdev->name, ret);
-				return ret;
-			}
-			break;
-		}
-	}
-	if (!found)
-	{
-		ERROR(
-			"axvisor: No subscriber device found with publisher_id: %llu and "
-			"key: 0x%llx\n",
-			publisher_id, key);
-		return -ENOENT;
-	}
-
-	INFO("axvisor: IVC channel %llu unsubscribed successfully\n", publisher_id);
-	return 0;
-}
-
-int ivc_unregister_subscriber_vdev(struct axivc_subscriber_vdev *vdev)
-{
-	if (!vdev)
-		return -EINVAL;
-
-	INFO(
-		"axvisor: Unregistering subscriber device %s publisher_id %lld key "
-		"%llx\n",
-		vdev->name, vdev->publisher_id, vdev->key);
-
-	if (vdev->active)
-	{
-		ERROR(
-			"axvisor: Cannot unregister active subscriber device %s (id=%d), "
-			"please close it first\n",
-			vdev->name, vdev->id);
-		return -EBUSY;
+		kfree(vdev);
+		goto unmap_subscription;
 	}
 
 	mutex_lock(&sub_vdev_lock);
-
-	misc_deregister(&vdev->misc);
-	list_del(&vdev->list);
-	kfree(vdev);
-
-	sub_vdev_count--;
+	list_add_tail(&vdev->list, &sub_vdev_list_head);
 	mutex_unlock(&sub_vdev_lock);
 
+	snprintf(sub_dev_name, MAX_IVC_DEV_NAME_LENGTH, "/dev/%s", vdev->name);
 	return 0;
+
+unmap_subscription:
+	memunmap(mapped_shm_base);
+rollback_subscription:
+	axivc_rollback_subscribe(publisher_id, key);
+	return err;
+}
+
+static int ivc_unsubscribe_channel(u64 publisher_id, u64 key)
+{
+	struct axivc_subscriber_vdev *vdev;
+	int err;
+
+	mutex_lock(&sub_vdev_lock);
+	list_for_each_entry(vdev, &sub_vdev_list_head, list)
+	{
+		if (vdev->publisher_id != publisher_id || vdev->key != key)
+			continue;
+		if (vdev->active || vdev->removing)
+		{
+			mutex_unlock(&sub_vdev_lock);
+			return -EBUSY;
+		}
+		vdev->removing = true;
+		mutex_unlock(&sub_vdev_lock);
+
+		err = hvc_unsubscribe_channel(publisher_id, key);
+		if (err)
+		{
+			mutex_lock(&sub_vdev_lock);
+			vdev->removing = false;
+			mutex_unlock(&sub_vdev_lock);
+			return -EIO;
+		}
+
+		misc_deregister(&vdev->misc);
+		mutex_lock(&sub_vdev_lock);
+		list_del(&vdev->list);
+		sub_vdev_count--;
+		mutex_unlock(&sub_vdev_lock);
+		memunmap(vdev->mapped_shm_base);
+		kfree(vdev);
+		return 0;
+	}
+	mutex_unlock(&sub_vdev_lock);
+	return -ENOENT;
+}
+
+static void axivc_notify_publisher(bool enabled, u64 publisher_id, u64 key)
+{
+	u64 err;
+
+	if (!enabled)
+		return;
+	err = hvc_notify_channel(publisher_id, key, publisher_id);
+	if (err)
+		WARNING(
+			"axvisor: IVC notify failed for publisher %llu key 0x%llx: "
+			"%llu\n",
+			publisher_id, key, err);
+}
+
+static void axivc_abort_send(
+	struct axivc_endpoint *endpoint, bool notify_publisher, u64 publisher_id,
+	u64 key)
+{
+	struct axivc_message_sender *tx = &endpoint->tx;
+	unsigned long deadline =
+		jiffies + msecs_to_jiffies(AXIVC_TRANSFER_TIMEOUT_MS);
+	bool published = tx->published_any;
+	int err;
+
+	for (;;)
+	{
+		err = axivc_message_try_abort(tx);
+		if (err != -EAGAIN)
+			break;
+
+		/* A full ring is the normal reason an in-flight send failed. Keep
+		 * retrying so a peer which resumes can observe ABORT instead of being
+		 * stranded forever in the partial logical message. */
+		axivc_notify_publisher(notify_publisher, publisher_id, key);
+		if (time_after_eq(jiffies, deadline))
+			break;
+		msleep(AXIVC_POLL_INTERVAL_MS);
+	}
+
+	if (!err && published)
+		axivc_notify_publisher(notify_publisher, publisher_id, key);
+	else if (err && err != -ENOMSG)
+		endpoint->tx_error = -EPIPE;
+}
+
+static ssize_t axivc_send_message(
+	struct axivc_endpoint *endpoint, bool notify_publisher, u64 publisher_id,
+	u64 key, const char __user *buf, size_t count)
+{
+	struct axivc_message_sender *tx = &endpoint->tx;
+	unsigned long deadline;
+	size_t sent = 0;
+	int err;
+
+	/* POSIX read/write cannot distinguish an empty logical message from
+	 * "no data". Keep the device ABI explicit instead of silently losing
+	 * the Message V1 boundary. */
+	if (!count)
+		return -EOPNOTSUPP;
+
+	err = mutex_lock_interruptible(&endpoint->tx_lock);
+	if (err)
+		return err;
+	if (endpoint->tx_error)
+	{
+		err = endpoint->tx_error;
+		goto unlock;
+	}
+
+	err = axivc_message_start(tx, count);
+	if (err)
+		goto unlock;
+
+	deadline = jiffies + msecs_to_jiffies(AXIVC_TRANSFER_TIMEOUT_MS);
+	for (;;)
+	{
+		u8 fragment[AXIVC_FRAGMENT_CAPACITY];
+		struct axivc_send_progress progress;
+		size_t chunk = min_t(size_t, sizeof(fragment), count - sent);
+
+		if (chunk && copy_from_user(fragment, buf + sent, chunk))
+		{
+			err = -EFAULT;
+			goto abort;
+		}
+		err = axivc_message_try_write(tx, fragment, chunk, &progress);
+		if (err)
+			goto abort;
+
+		sent += progress.consumed;
+		if (progress.published_slots)
+		{
+			deadline = jiffies + msecs_to_jiffies(AXIVC_TRANSFER_TIMEOUT_MS);
+			axivc_notify_publisher(notify_publisher, publisher_id, key);
+		}
+		if (progress.complete)
+		{
+			mutex_unlock(&endpoint->tx_lock);
+			return count;
+		}
+		if (progress.published_slots)
+			continue;
+		if (time_after_eq(jiffies, deadline))
+		{
+			err = -ETIMEDOUT;
+			goto abort;
+		}
+		if (msleep_interruptible(AXIVC_POLL_INTERVAL_MS))
+		{
+			err = -ERESTARTSYS;
+			goto abort;
+		}
+	}
+
+abort:
+	axivc_abort_send(endpoint, notify_publisher, publisher_id, key);
+unlock:
+	mutex_unlock(&endpoint->tx_lock);
+	return err;
+}
+
+static ssize_t axivc_recv_message(
+	struct axivc_endpoint *endpoint, bool notify_publisher, u64 publisher_id,
+	u64 key, char __user *buf, size_t count)
+{
+	struct axivc_message_receiver *rx = &endpoint->rx;
+	struct axivc_message_meta meta;
+	unsigned long deadline;
+	size_t received = 0;
+	bool available;
+	ssize_t err;
+
+	if (!count)
+		return 0;
+	err = mutex_lock_interruptible(&endpoint->rx_lock);
+	if (err)
+		return err;
+
+	err = axivc_message_peek_meta(rx, &meta, &available);
+	if (err || !available)
+		goto unlock;
+	if (meta.len > count)
+	{
+		err = -EMSGSIZE;
+		goto unlock;
+	}
+
+	deadline = jiffies + msecs_to_jiffies(AXIVC_TRANSFER_TIMEOUT_MS);
+	for (;;)
+	{
+		u8 fragment[AXIVC_FRAGMENT_CAPACITY];
+		struct axivc_receive_progress progress;
+
+		err = axivc_message_try_read(rx, fragment, sizeof(fragment), &progress);
+		if (err)
+		{
+			/* A slot carrying a valid ABORT frame was consumed even though
+			 * the message API reports it as an error; notify the producer that
+			 * ring space was released. */
+			if (err == -ECONNRESET)
+				axivc_notify_publisher(notify_publisher, publisher_id, key);
+			goto unlock;
+		}
+		if (progress.consumed_slots)
+		{
+			deadline = jiffies + msecs_to_jiffies(AXIVC_TRANSFER_TIMEOUT_MS);
+			axivc_notify_publisher(notify_publisher, publisher_id, key);
+		}
+		if (progress.written &&
+			copy_to_user(buf + received, fragment, progress.written))
+		{
+			err = -EFAULT;
+			axivc_message_receiver_poison(rx, err);
+			goto unlock;
+		}
+		received += progress.written;
+		if (progress.complete)
+		{
+			/* Consume a valid transport-level empty message so it cannot
+			 * block the ring, but report that the read/write adapter cannot
+			 * represent its boundary. */
+			err = meta.len == 0 ? -EOPNOTSUPP : received;
+			goto unlock;
+		}
+		if (progress.consumed_slots)
+			continue;
+		if (time_after_eq(jiffies, deadline))
+		{
+			err = -ETIMEDOUT;
+			axivc_message_receiver_poison(rx, err);
+			goto unlock;
+		}
+		if (msleep_interruptible(AXIVC_POLL_INTERVAL_MS))
+		{
+			err = -ERESTARTSYS;
+			axivc_message_receiver_poison(rx, err);
+			goto unlock;
+		}
+	}
+
+unlock:
+	mutex_unlock(&endpoint->rx_lock);
+	return err;
 }
 
 static ssize_t axivc_publisher_read(
 	struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
 	struct axivc_publisher_vdev *vdev = file->private_data;
-	char msg[128];
-	size_t len;
 
 	if (!vdev->active)
-	{
-		ERROR(
-			"axvisor: Device %s is not active, cannot write to shared memory\n",
-			vdev->name);
 		return -ENODEV;
-	}
-
-	snprintf(msg, sizeof(msg), "Hello from AXIVC publisher %s!\n", vdev->name);
-	len = strlen(msg);
-
-	if (*ppos >= len)
-		return 0;
-
-	if (count > len - *ppos)
-		count = len - *ppos;
-
-	if (copy_to_user(buf, msg + *ppos, count))
-		return -EFAULT;
-
-	*ppos += count;
-	return count;
+	return axivc_recv_message(&vdev->endpoint, false, 0, vdev->key, buf, count);
 }
 
 static ssize_t axivc_publisher_write(
 	struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
 	struct axivc_publisher_vdev *vdev = file->private_data;
-	void __iomem *mapped_shm_base = vdev->mapped_shm_base;
-	ssize_t ret;
 
 	if (!vdev->active)
-	{
-		ERROR(
-			"axvisor: Device %s is not active, cannot write to shared memory\n",
-			vdev->name);
 		return -ENODEV;
-	}
-
-	INFO(
-		"axvisor: Try to write %zu bytes to IVCChannel key [%llx]\n", count,
-		vdev->key);
-
-	ret = shm_ring_enqueue(mapped_shm_base, buf, count);
-	if (ret < 0)
-
-	{
-		if (ret == -EAGAIN)
-		{
-			ERROR(
-				"axvisor: Shared memory ring buffer is full, cannot enqueue "
-				"data\n");
-			return ret; // Return error if the ring buffer is full
-		}
-		else
-		{
-			ERROR(
-				"axvisor: Failed to enqueue data to shared ring buffer, error "
-				"code: %ld\n",
-				ret);
-			return ret; // Return other error codes
-		}
-	}
-
-	// Flush the cache to ensure data is written to shared memory.
-	flush_cache_vmap(
-		(unsigned long)mapped_shm_base,
-		(unsigned long)mapped_shm_base + vdev->shm_size);
-
-	INFO(
-		"axvisor: Written %zd bytes to IVCChannel key [%llx]\n", ret,
-		vdev->key);
-
-	return ret;
+	return axivc_send_message(&vdev->endpoint, false, 0, vdev->key, buf, count);
 }
 
 static int axivc_publisher_open(struct inode *inode, struct file *file)
 {
-	struct axivc_publisher_vdev *vdev;
+	struct axivc_publisher_vdev *vdev =
+		container_of(file->private_data, struct axivc_publisher_vdev, misc);
 
-	vdev = container_of(file->private_data, struct axivc_publisher_vdev, misc);
-	file->private_data = vdev;
+	mutex_lock(&pub_vdev_lock);
+	if (vdev->active || vdev->removing)
+	{
+		int err = vdev->removing ? -ENODEV : -EBUSY;
 
+		mutex_unlock(&pub_vdev_lock);
+		return err;
+	}
 	vdev->active = true;
-
-	INFO(
-		"axvisor: Opened device %s, publisher_shm_base: 0x%llx, "
-		"publisher_shm_size: 0x%llx\n",
-		vdev->name, vdev->shm_base, vdev->shm_size);
-
+	mutex_unlock(&pub_vdev_lock);
+	file->private_data = vdev;
 	return 0;
 }
 
 static int axivc_publisher_release(struct inode *inode, struct file *file)
 {
 	struct axivc_publisher_vdev *vdev = file->private_data;
-	INFO("axvisor: Closing device %s\n", vdev->name);
-	if (vdev->active)
-	{
-		vdev->active = false;
-		INFO("axvisor: Device %s is now inactive\n", vdev->name);
-	}
-	else
-	{
-		WARNING(
-			"axvisor: Device %s was already inactive, check why?\n",
-			vdev->name);
-	}
-	return 0;
-}
 
-static int axivc_subscriber_open(struct inode *inode, struct file *file)
-{
-	struct axivc_subscriber_vdev *vdev;
-	vdev = container_of(file->private_data, struct axivc_subscriber_vdev, misc);
-	file->private_data = vdev;
-	vdev->active = true;
-
-	// Check if the device is opened with write permission
-	if ((file->f_flags & O_ACCMODE) == O_WRONLY ||
-		(file->f_flags & O_ACCMODE) == O_RDWR)
-	{
-		ERROR(
-			"Subscriber %s cannot be opened with write permission\n",
-			vdev->name);
-		return -EPERM; // Return permission error
-	}
-
-	INFO("axvisor: Opened device %s success\n", vdev->name);
-	return 0;
-}
-
-static int axivc_subscriber_release(struct inode *inode, struct file *file)
-{
-	struct axivc_subscriber_vdev *vdev = file->private_data;
-	if (vdev->active)
-	{
-		vdev->active = false;
-		INFO("axvisor: Device %s is now inactive\n", vdev->name);
-	}
-	else
-	{
-		WARNING(
-			"axvisor: Device %s was already inactive, check why?\n",
-			vdev->name);
-	}
-
+	mutex_lock(&pub_vdev_lock);
+	vdev->active = false;
+	mutex_unlock(&pub_vdev_lock);
 	return 0;
 }
 
@@ -758,66 +680,60 @@ static ssize_t axivc_subscriber_read(
 	struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
 	struct axivc_subscriber_vdev *vdev = file->private_data;
-	void __iomem *mapped_shm_base = vdev->mapped_shm_base;
-	u64 sequence = 0;
-	ssize_t ret;
 
 	if (!vdev->active)
-	{
-		ERROR(
-			"axvisor: Device %s is not active, cannot read from shared "
-			"memory\n",
-			vdev->name);
 		return -ENODEV;
-	}
-	if (count == 0)
-		return 0;
+	return axivc_recv_message(
+		&vdev->endpoint, true, vdev->publisher_id, vdev->key, buf, count);
+}
 
-	ret = axivc_region_validate(
-		mapped_shm_base, vdev->shm_size, vdev->publisher_id, vdev->key);
-	if (ret)
-	{
-		ERROR(
-			"axvisor: Shared IVC region validation failed for publisher "
-			"[%lld] key [%llx], error code: %zd\n",
-			vdev->publisher_id, vdev->key, ret);
-		return ret;
-	}
-	INFO(
-		"axvisor: Try to read %ld bytes from IVCChannel ID [%lld] key [%llx]\n",
-		count, vdev->publisher_id, vdev->key);
+static ssize_t axivc_subscriber_write(
+	struct file *file, const char __user *buf, size_t count, loff_t *ppos)
+{
+	struct axivc_subscriber_vdev *vdev = file->private_data;
 
-	ret = axivc_region_recv_request_and_ack(
-		mapped_shm_base, buf, count, &sequence);
-	if (ret < 0)
-	{
-		ERROR(
-			"axvisor: Failed to read data from shared ring buffer, error "
-			"code: %zd\n",
-			ret);
-		return ret; // Return error code
-	}
-	if (ret > 0)
-	{
-		u64 notify_ret = hvc_notify_channel(
-			vdev->publisher_id, vdev->key, vdev->publisher_id);
-		if (notify_ret)
-			WARNING(
-				"axvisor: Failed to notify IVC publisher after seq %llu, "
-				"error code: %llu\n",
-				sequence, notify_ret);
-	}
+	if (!vdev->active)
+		return -ENODEV;
+	return axivc_send_message(
+		&vdev->endpoint, true, vdev->publisher_id, vdev->key, buf, count);
+}
 
-	return ret; // Return number of bytes read
+static int axivc_subscriber_open(struct inode *inode, struct file *file)
+{
+	struct axivc_subscriber_vdev *vdev =
+		container_of(file->private_data, struct axivc_subscriber_vdev, misc);
+
+	mutex_lock(&sub_vdev_lock);
+	if (vdev->active || vdev->removing)
+	{
+		int err = vdev->removing ? -ENODEV : -EBUSY;
+
+		mutex_unlock(&sub_vdev_lock);
+		return err;
+	}
+	vdev->active = true;
+	mutex_unlock(&sub_vdev_lock);
+	file->private_data = vdev;
+	return 0;
+}
+
+static int axivc_subscriber_release(struct inode *inode, struct file *file)
+{
+	struct axivc_subscriber_vdev *vdev = file->private_data;
+
+	mutex_lock(&sub_vdev_lock);
+	vdev->active = false;
+	mutex_unlock(&sub_vdev_lock);
+	return 0;
 }
 
 static long
 axivc_manager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 {
-	int ret = 0;
+	int err = 0;
 	ivc_publish_arg_t publish_arg;
 	ivc_subscribe_arg_t subscribe_arg;
-	uint64_t shm_size = 0;
+	u64 shm_size = 0;
 
 	switch (ioctl)
 	{
@@ -834,20 +750,15 @@ axivc_manager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 			publish_arg.channel_key, publish_arg.channel_size);
 
 		shm_size = publish_arg.channel_size;
-		// Initialize publisher shared memory channel.
-		if (ivc_publish_channel(
-				publish_arg.channel_key, shm_size, publish_arg.device_name))
-		{
-			ERROR(
-				"axvisor: Failed to publish channel with key: 0x%llx\n",
-				publish_arg.channel_key);
-			return -EIO;
-		}
+		err = ivc_publish_channel(
+			publish_arg.channel_key, shm_size, publish_arg.device_name);
+		if (err)
+			return err;
 
 		if (copy_to_user(
 				(u64 __user *)arg, &publish_arg, sizeof(ivc_publish_arg_t)))
 		{
-			ERROR("axvisor: Failed to copy channel key to user space\n");
+			ivc_unpublish_channel(publish_arg.channel_key);
 			return -EFAULT;
 		}
 
@@ -864,13 +775,13 @@ axivc_manager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 			"axvisor: Unpublishing channel with key: 0x%llx\n",
 			publish_arg.channel_key);
 
-		ret = ivc_unpublish_channel(publish_arg.channel_key);
-		if (ret)
+		err = ivc_unpublish_channel(publish_arg.channel_key);
+		if (err)
 		{
 			ERROR(
 				"axvisor: Failed to unpublish channel with key: 0x%llx\n",
 				publish_arg.channel_key);
-			return ret;
+			return err;
 		}
 
 		break;
@@ -886,21 +797,22 @@ axivc_manager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 			"axvisor: Subscribing to channel [%llu] with key: 0x%llx\n",
 			subscribe_arg.target_publisher_id, subscribe_arg.channel_key);
 
-		ret = ivc_subscribe_channel(
+		err = ivc_subscribe_channel(
 			subscribe_arg.target_publisher_id, subscribe_arg.channel_key,
 			subscribe_arg.device_name);
-		if (ret)
+		if (err)
 		{
 			ERROR(
 				"axvisor: Failed to subscribe to channel %llu\n",
 				subscribe_arg.target_publisher_id);
-			return ret;
+			return err;
 		}
 
 		if (copy_to_user(
 				(u64 __user *)arg, &subscribe_arg, sizeof(ivc_subscribe_arg_t)))
 		{
-			ERROR("axvisor: Failed to copy channel key to user space\n");
+			ivc_unsubscribe_channel(
+				subscribe_arg.target_publisher_id, subscribe_arg.channel_key);
 			return -EFAULT;
 		}
 		break;
@@ -916,14 +828,14 @@ axivc_manager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 			"axvisor: Unsubscribing from channel [%llu] with key: 0x%llx\n",
 			subscribe_arg.target_publisher_id, subscribe_arg.channel_key);
 
-		ret = ivc_unsubscribe_channel(
+		err = ivc_unsubscribe_channel(
 			subscribe_arg.target_publisher_id, subscribe_arg.channel_key);
-		if (ret)
+		if (err)
 		{
 			ERROR(
 				"axvisor: Failed to unsubscribe from channel %llu\n",
 				subscribe_arg.target_publisher_id);
-			return ret;
+			return err;
 		}
 
 		break;
@@ -932,7 +844,7 @@ axivc_manager_ioctl(struct file *file, unsigned int ioctl, unsigned long arg)
 		return -EINVAL;
 	}
 
-	return ret;
+	return err;
 }
 
 static int axivc_manager_open(struct inode *inode, struct file *file)
@@ -943,9 +855,9 @@ static int axivc_manager_open(struct inode *inode, struct file *file)
 
 static int axivc_manager_release(struct inode *inode, struct file *file)
 {
-	int ret = 0;
+	int err = 0;
 	INFO("axvisor: Closing device %s\n", IVC_DEV_NAME);
-	return ret;
+	return err;
 }
 
 static const struct file_operations axivc_publisher_fops = {
@@ -960,8 +872,7 @@ static const struct file_operations axivc_subscriber_fops = {
 	.owner = THIS_MODULE,
 	.open = axivc_subscriber_open,
 	.read = axivc_subscriber_read,
-	// .unlocked_ioctl = axivc_subscriber_ioctl,
-	// .compat_ioctl = axivc_subscriber_ioctl,
+	.write = axivc_subscriber_write,
 	.release = axivc_subscriber_release,
 };
 
@@ -979,64 +890,46 @@ static struct miscdevice axvisor_ivc_management_vdev = {
 	.fops = &axivc_manager_fops,
 };
 
-int init_ivc_devices()
+int init_ivc_devices(void)
 {
-	int ret = 0;
+	int err = 0;
 
 	// Register a IVC management device.
-	ret = misc_register(&axvisor_ivc_management_vdev);
-	if (ret)
+	err = misc_register(&axvisor_ivc_management_vdev);
+	if (err)
 	{
 		WARNING(
 			"axvisor: Failed to register misc device %s\n",
 			axvisor_ivc_management_vdev.name);
-		return ret;
+		return err;
 	}
 	INFO(
 		"axvisor: IVC management device registered with name %s\n",
 		axvisor_ivc_management_vdev.name);
 
-	return ret;
+	return err;
 }
 
-void uninit_ivc_devices()
+void uninit_ivc_devices(void)
 {
 	struct axivc_publisher_vdev *pvdev, *ptmp;
 	struct axivc_subscriber_vdev *svdev, *stmp;
-	int ret;
 
-	INFO("%s\n", __func__);
-
-	// Cleanup the publisher devices.
 	list_for_each_entry_safe(pvdev, ptmp, &pub_vdev_list_head, list)
 	{
-		// Call the hypervisor to unregister the channel
-		ret = hvc_unpublish_channel(pvdev->key);
-		if (ret != 0)
-		{
-			ERROR(
-				"axvisor: Failed to unregister publish channel key 0x%llx, "
-				"error code: %d\n",
-				pvdev->key, ret);
-		}
-		ivc_unregister_publisher_vdev(pvdev);
+		hvc_unpublish_channel(pvdev->key);
+		misc_deregister(&pvdev->misc);
+		list_del(&pvdev->list);
+		memunmap(pvdev->mapped_shm_base);
+		kfree(pvdev);
 	}
-	// Cleanup the subscriber devices.
 	list_for_each_entry_safe(svdev, stmp, &sub_vdev_list_head, list)
 	{
-		// Call the hypervisor to unregister the channel
-		ret = hvc_unsubscribe_channel(svdev->publisher_id, svdev->key);
-		if (ret != 0)
-		{
-			ERROR(
-				"axvisor: Failed to unsubscribe from channel %llu with key "
-				"0x%llx, error code: %d\n",
-				svdev->publisher_id, svdev->key, ret);
-		}
-		ivc_unregister_subscriber_vdev(svdev);
+		hvc_unsubscribe_channel(svdev->publisher_id, svdev->key);
+		misc_deregister(&svdev->misc);
+		list_del(&svdev->list);
+		memunmap(svdev->mapped_shm_base);
+		kfree(svdev);
 	}
-
 	misc_deregister(&axvisor_ivc_management_vdev);
-
-	INFO("axvisor driver unloaded\n");
 }

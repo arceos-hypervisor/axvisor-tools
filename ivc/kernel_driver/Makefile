@@ -24,6 +24,8 @@ MODULE := axvisor-driver
 SRC := main.o \
 	   hvc.o \
 	   ring.o \
+	   message.o \
+	   region.o \
 	   ivc.o
 
 # Default target
