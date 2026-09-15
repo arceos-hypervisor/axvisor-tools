@@ -26,9 +26,11 @@ PYBIND_LIB		:= $(BUILD_DIR)/$(PYBIND_LIB_NAME).so
 .PHONY: pybind venv test
 pybind: venv $(PYBIND_LIB)
 
-$(PYBIND_LIB): $(PYBIND_SRC)
+$(PYBIND_LIB): $(PYBIND_SRC) $(BUILD_DIR)/lib$(LIB_NAME).a \
+	$(PARENT_DIR)userspace/ivc/ulib.h $(wildcard $(PARENT_DIR)ivc/uapi/*.h) \
+	$(MAKEFILE_DIR)Makefile
 	@echo "Building Python bindings for $(LIB_NAME)..."
-	$(CXXCOMP) -std=c++11 -shared -fPIC -o $@ $< $(BUILD_DIR)/lib$(LIB_NAME).a -I$(PARENT_DIR)include $(shell $(PYTHON) -m pybind11 --includes) 
+	$(CXXCOMP) -std=c++11 -shared -fPIC -o $@ $< $(BUILD_DIR)/lib$(LIB_NAME).a -I$(PARENT_DIR)ivc/uapi -I$(PARENT_DIR)userspace/ivc $(shell $(PYTHON) -m pybind11 --includes)
 	@echo "Python bindings built successfully."
 
 venv: $(PYTHON)

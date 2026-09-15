@@ -1,7 +1,7 @@
-#include <ivc/ulib.h>
+#include "ulib.h"
 
-#include <ivc/ioctl_args.h>
-#include <ivc/ivc_dev.h>
+#include <ioctl_args.h>
+#include <ivc_dev.h>
 
 #include <errno.h>
 #include <fcntl.h>

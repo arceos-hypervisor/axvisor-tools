@@ -1,4 +1,22 @@
+# Kernel module build artifacts (root and feature subdirectories)
+*.ko
+*.mod
+*.mod.c
+*.o
+.*.cmd
+.module-common.o
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Userspace build output
+/build/
+
+# Locally committed-by-accident demo binaries
+*-aarch64
+
+# Misc
 /target
 /.vscode
-
-*/target/*
+*/target/
+__pycache__/

@@ -1,4 +1,4 @@
-#include <ivc/app_proto.h>
+#include "app_proto.h"
 
 #include <limits.h>
 #include <string.h>

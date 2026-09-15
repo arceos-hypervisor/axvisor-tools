@@ -2,8 +2,8 @@
 
 #include <linux/types.h>
 
-#include <ivc/ioctl_args.h>
-#include <ivc/ivc_dev.h>
+#include <ioctl_args.h>
+#include <ivc_dev.h>
 
 #define MAX_VDEVS 16
 

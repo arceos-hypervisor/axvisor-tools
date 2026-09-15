@@ -5,6 +5,8 @@
 
 #include <linux/module.h>
 
+#include <axvisor_ivshmem.h>
+
 #include "includes/hvc.h"
 #include "includes/ivc.h"
 #include "includes/utils.h"
@@ -30,7 +32,14 @@ static int __init axvisor_init(void);
 static void __exit axvisor_exit(void);
 
 MODULE_AUTHOR("axvisor group");
-MODULE_LICENSE("GPL v3 | Mulan PSL v2");
+/*
+ * License compatibility: each source file keeps its original license
+ * (IVC driver: GPL v3 | Mulan PSL v2; uio_ivshmem.c: GPL). The module-wide
+ * tag must be a kernel-recognized GPL-compatible string, otherwise the
+ * loader refuses the GPL-only UIO core symbols (uio_register_device /
+ * uio_unregister_device) pulled in by the IVSHMEM part of this module.
+ */
+MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Management driver for AxVisor hypervisor");
 MODULE_VERSION(AXVISOR_VERSION);
 
@@ -46,12 +55,25 @@ static int __init axvisor_init(void)
 		ERROR("axvisor: Failed to initialize IVC devices\n");
 		return ret;
 	}
+
+	/*
+	 * Registering the PCI driver succeeds even when no IVSHMEM device
+	 * is present; per-device probe failures clean up after themselves.
+	 */
+	ret = axvisor_ivshmem_register();
+	if (ret)
+	{
+		ERROR("axvisor: Failed to register IVSHMEM UIO driver\n");
+		uninit_ivc_devices();
+		return ret;
+	}
 	return 0;
 }
 
 static void __exit axvisor_exit(void)
 {
 	INFO("Exiting axvisor driver\n");
+	axvisor_ivshmem_unregister();
 	uninit_ivc_devices();
 }
 

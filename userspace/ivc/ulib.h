@@ -1,6 +1,6 @@
 #pragma once
 
-#include "./ioctl_args.h"
+#include <ioctl_args.h>
 
 #include <stddef.h>
 #include <stdio.h>

@@ -3,6 +3,12 @@
  *
  * The driver requires exactly one MSI-X vector. It never falls back to MSI
  * or INTx, and it leaves protocol state in BAR0/BAR2 for userspace.
+ *
+ * This file is compiled into axvisor.ko together with the IVC driver (see
+ * ivc/kernel_driver/). Its PCI driver registration is performed by
+ * axvisor_ivshmem_register() and axvisor_ivshmem_unregister(), which are
+ * called from main.c; it is not a standalone kernel module. The file keeps
+ * its original GPL license; the unified module license tag lives in main.c.
  */
 
 #include <linux/interrupt.h>
@@ -11,6 +17,8 @@
 #include <linux/pci.h>
 #include <linux/spinlock.h>
 #include <linux/uio_driver.h>
+
+#include "axvisor_ivshmem.h"
 
 #define IVSHMEM_VENDOR_ID 0x1af4
 #define IVSHMEM_DEVICE_ID 0x1110
@@ -176,6 +184,7 @@ static const struct pci_device_id ivshmem_uio_ids[] = {
 	{ PCI_DEVICE(IVSHMEM_VENDOR_ID, IVSHMEM_DEVICE_ID) },
 	{ }
 };
+/* Keep the PCI alias in axvisor.ko modinfo for auto-loading and inspection. */
 MODULE_DEVICE_TABLE(pci, ivshmem_uio_ids);
 
 static struct pci_driver ivshmem_uio_driver = {
@@ -184,6 +193,22 @@ static struct pci_driver ivshmem_uio_driver = {
 	.probe = ivshmem_uio_probe,
 	.remove = ivshmem_uio_remove,
 };
-module_pci_driver(ivshmem_uio_driver);
 
-MODULE_LICENSE("GPL");
+/*
+ * Register the IVSHMEM PCI driver. Called once from axvisor_init() in
+ * main.c. Succeeds even when no IVSHMEM device is present; per-device
+ * failures are handled and cleaned up by ivshmem_uio_probe() itself.
+ */
+int axvisor_ivshmem_register(void)
+{
+	return pci_register_driver(&ivshmem_uio_driver);
+}
+
+/*
+ * Unregister the IVSHMEM PCI driver. Called from axvisor_exit() in main.c
+ * before the IVC devices are torn down.
+ */
+void axvisor_ivshmem_unregister(void)
+{
+	pci_unregister_driver(&ivshmem_uio_driver);
+}

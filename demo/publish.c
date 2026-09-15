@@ -1,5 +1,5 @@
-#include <ivc/app_proto.h>
-#include <ivc/ulib.h>
+#include "app_proto.h"
+#include <ulib.h>
 
 #include <stdio.h>
 #include <stdlib.h>
